@@ -1,0 +1,10 @@
+{
+  "name": "koishi-plugin-query-balance",
+  "version": "0.0.0",
+  "description": "Query API balance and usage",
+  "koishi": {
+    "description": "查询 API 余额与用量"
+  },
+  "main": "src/index.ts",
+  "license": "MIT"
+}
