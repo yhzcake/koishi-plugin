@@ -1,10 +1,54 @@
 {
   "name": "koishi-plugin-query-balance",
-  "version": "0.0.0",
-  "description": "Query API balance and usage",
-  "koishi": {
-    "description": "查询 API 余额与用量"
+  "version": "0.1.2",
+  "description": "仅自用：目前主要适配蓝钦与 DeepSeek 的 API 余额和用量查询",
+  "author": "yhzcake",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yhzcake/koishi-plugin.git",
+    "directory": "plugins/query-balance"
   },
-  "main": "src/index.ts",
-  "license": "MIT"
+  "bugs": {
+    "url": "https://github.com/yhzcake/koishi-plugin/issues"
+  },
+  "homepage": "https://www.yhzcake.cn",
+  "koishi": {
+    "description": {
+      "zh": "仅自用：目前主要适配蓝钦与 DeepSeek 的 API 余额和用量查询",
+      "en": "Personal use only: API balance and usage queries, currently focused on Lanqin and DeepSeek"
+    },
+    "service": {
+      "required": [
+        "http"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "koishi": "^4.18.7"
+  },
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json && esbuild src/index.ts --bundle --platform=node --format=cjs --target=es2022 --packages=external --keep-names --outfile=lib/index.js",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.5",
+    "esbuild": "^0.23.1",
+    "typescript": "^5.6.2"
+  },
+  "license": "MIT",
+  "files": [
+    "lib",
+    "README.md"
+  ],
+  "keywords": [
+    "koishi",
+    "koishi-plugin",
+    "api",
+    "balance",
+    "usage",
+    "lanqin",
+    "deepseek"
+  ]
 }

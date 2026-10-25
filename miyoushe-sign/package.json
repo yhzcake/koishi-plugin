@@ -1,0 +1,62 @@
+{
+  "name": "koishi-plugin-miyoushe-sign",
+  "version": "0.1.2",
+  "description": "仅自用：米游社与米哈游游戏签到、记录查询及账号管理",
+  "author": "yhzcake",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yhzcake/koishi-plugin.git",
+    "directory": "plugins/miyoushe-sign"
+  },
+  "bugs": {
+    "url": "https://github.com/yhzcake/koishi-plugin/issues"
+  },
+  "homepage": "https://www.yhzcake.cn",
+  "koishi": {
+    "description": {
+      "zh": "仅自用：米游社与米哈游游戏签到、记录查询及账号管理",
+      "en": "Personal use only: HoYoLAB game check-in, records, and account management"
+    },
+    "service": {
+      "required": [
+        "database",
+        "http"
+      ],
+      "optional": [
+        "puppeteer"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "koishi": "^4.18.7"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  },
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json && esbuild src/index.ts --bundle --platform=node --format=cjs --target=es2022 --packages=external --keep-names --outfile=lib/index.js",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.5",
+    "esbuild": "^0.23.1",
+    "typescript": "^5.6.2"
+  },
+  "license": "MIT",
+  "files": [
+    "lib",
+    "README.md"
+  ],
+  "keywords": [
+    "koishi",
+    "koishi-plugin",
+    "mihoyo",
+    "miyoushe",
+    "hoyolab",
+    "genshin",
+    "star-rail",
+    "zenless-zone-zero"
+  ]
+}

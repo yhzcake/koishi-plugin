@@ -1,0 +1,1 @@
+{"root":["./src/accounts.ts","./src/automation.ts","./src/client.ts","./src/data-cache.ts","./src/fribbels-data.ts","./src/fribbels-score.ts","./src/index.ts","./src/panel.ts","./src/records.ts","./src/starrail-data.ts","./src/vault.ts"],"version":"5.9.3"}

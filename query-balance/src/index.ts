@@ -85,9 +85,28 @@ function formatNumber(value: unknown) {
 
 function formatUsage(value: unknown, unit: string) {
   if (!isRecord(value)) return `用量：${formatNumber(value)}${unit ? ` ${unit}` : ''}`
+  const labels: Record<string, string> = {
+    actual_cost: '实际费用',
+    cache_creation_tokens: '缓存创建令牌数',
+    cache_hit_rate: '缓存命中率',
+    cache_read_tokens: '缓存读取令牌数',
+    cache_write_tokens: '缓存写入令牌数',
+    cost: '费用',
+    input_tokens: '输入令牌数',
+    output_tokens: '输出令牌数',
+    requests: '请求次数',
+    total_cost: '总费用',
+    total_tokens: '总令牌数',
+  }
   const lines = Object.entries(value)
     .filter(([, item]) => item !== undefined && item !== null)
-    .map(([key, item]) => `${key}：${formatNumber(item)}${['cost', 'actual_cost', 'amount', 'total_cost'].includes(key) ? ` ${unit}` : ''}`)
+    .map(([key, item]) => {
+      if (key === 'cache_hit_rate') {
+        const rate = getNumber(item)
+        return `${labels[key]}：${rate === undefined ? formatNumber(item) : `${formatNumber(rate * 100)}%`}`
+      }
+      return `${labels[key] || key}：${formatNumber(item)}${['cost', 'actual_cost', 'amount', 'total_cost'].includes(key) ? ` ${unit}` : ''}`
+    })
   return lines.length ? lines.join('\n') : '用量：-'
 }
 
@@ -212,7 +231,6 @@ export function apply(ctx: Context, config: Config) {
           `账号：${account.name || '-'}`,
           `状态：${data.is_available === false ? '不可用' : '可用'}`,
           ...lines,
-          `用量：DeepSeek 官方余额接口未提供${monthly ? '本月' : '今日'}累计用量。`,
         ].join('\n')
       }
       const { remaining, unit } = getBalance(data)
