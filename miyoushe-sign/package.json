@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-miyoushe-sign",
-  "version": "0.1.2",
+  "version": "0.1.4",
   "description": "仅自用：米游社与米哈游游戏签到、记录查询及账号管理",
   "author": "yhzcake",
   "repository": {

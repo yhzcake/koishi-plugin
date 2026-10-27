@@ -1,9 +1,9 @@
 import { Context, Schema, Session } from 'koishi'
 import { randomBytes, randomUUID } from 'node:crypto'
 import QRCode from 'qrcode'
-import { createAccounts, GameRole, parseCookie } from './accounts'
+import { createAccounts, DiscoveredRole, GameRole, parseCookie } from './accounts'
 import { createClient, forums, games, Forum, Game } from './client'
-import { createRecords, PanelData, recordTypes } from './records'
+import { createRecords, formatAccountOverview, PanelData, recordTypes } from './records'
 import { createVault } from './vault'
 import { createPanel } from './panel'
 import { runAutoPassport } from './automation'
@@ -58,8 +58,8 @@ async function renderQr(ctx: Context, url: string) {
   })
 }
 
-function identity(session: Session) {
-  return session.isDirect && session.platform && session.userId ? [session.platform, session.userId] as const : undefined
+function identity(session: Session, allowGroup = false) {
+  return (allowGroup || session.isDirect) && session.platform && session.userId ? [session.platform, session.userId] as const : undefined
 }
 
 function day() {
@@ -84,6 +84,33 @@ export function apply(ctx: Context, config: Config) {
   const autoRunning = new Set<string>()
   const communityRunning = new Set<string>()
   const qrRunning = new Set<string>()
+
+  async function queryRoles(owner: readonly [string, string], game: string) {
+    let roles = (await accounts.roles(...owner)).filter(role => role.game === game)
+    if (roles.length) return roles
+    for (const row of await accounts.passports(...owner)) {
+      if (!row.cookie) continue
+      await accounts.use(...owner, row.ltuid, 'ck', async cookie => {
+        const discovered = await client.discover(cookie)
+        if (!discovered.length) return
+        const previous = (await accounts.roles(...owner)).filter(role => role.ltuid === row.ltuid && gameNames.includes(role.game as Game)).map(role => ({ game: role.game as Game, uid: role.uid, region: role.region }))
+        const merged = [...discovered, ...previous.filter(role => !discovered.some(item => item.game === role.game && item.uid === role.uid && item.region === role.region))]
+        await accounts.save(...owner, row.ltuid, cookie, merged)
+      })
+    }
+    roles = (await accounts.roles(...owner)).filter(role => role.game === game)
+    return roles
+  }
+
+  async function togglePassport(owner: readonly [string, string], first: string, second: string | undefined, kind: 'cookie' | 'stoken') {
+    const state = ['on', 'off'].includes(first) ? first : second
+    const ltuid = ['on', 'off'].includes(first) ? second : first
+    if (!state || !['on', 'off'].includes(state) || ltuid !== undefined && !passportId.test(ltuid)) return { error: '用法：on|off [通行证ID]，也兼容 通行证ID on|off。' } as const
+    const rows = (await accounts.passports(...owner)).filter(row => row[kind] && (!ltuid || row.ltuid === ltuid))
+    if (!rows.length) return { error: kind === 'cookie' ? '未找到已绑定游戏 CK 的通行证，请先私聊扫码登录。' : '未找到已绑定 SToken 的通行证，请先私聊扫码登录。' } as const
+    if (rows.length > 1) return { error: `存在多个通行证，请指定：${rows.map(row => row.ltuid).join('、')}。` } as const
+    return { ltuid: rows[0].ltuid, state } as const
+  }
 
   function panelSummary(data: PanelData) {
     return data.characters.map(character => [
@@ -128,7 +155,7 @@ export function apply(ctx: Context, config: Config) {
     if (!row) return undefined
     return accounts.device(platform, userId, ltuid, async device => {
       const current = device || { deviceId: randomUUID().replace(/-/g, ''), deviceFp: '' }
-      if (current.deviceFp && row.fpExpires && Number(row.fpExpires) > Date.now()) return current
+      if (current.deviceFp && (!row.fpExpires || Number(row.fpExpires) > Date.now())) return current
       try {
         const fp = await accounts.use(platform, userId, ltuid, 'ck', cookie => client.fingerprint(current.deviceId, !(region.startsWith('cn_') || region.endsWith('_cn')), cookie))
         const updated = { deviceId: current.deviceId, deviceFp: fp }
@@ -224,11 +251,15 @@ export function apply(ctx: Context, config: Config) {
         if (!stoken || !/^\d{1,20}$/.test(ltuid) || !mid) return '扫码返回的账号信息不完整，未保存。'
         const ltoken = await client.qrExchange(stoken, mid)
         const token = `stuid=${ltuid};stoken=${stoken};mid=${mid};ltoken=${ltoken};`
+        await accounts.saveToken(...owner, ltuid, token)
         const cookie = await client.exchangeCookie(token, ltuid)
         const roles = await client.discover(cookie)
-        if (!roles.length) return '已确认扫码，但未查询到游戏角色，未保存凭证。'
+        if (!roles.length) {
+          const previous: DiscoveredRole[] = (await accounts.roles(...owner)).filter(role => role.ltuid === ltuid && gameNames.includes(role.game as Game)).map(role => ({ game: role.game as Game, uid: role.uid, region: role.region }))
+          await accounts.save(...owner, ltuid, cookie, previous)
+          return `通行证 ${ltuid} 的凭证已保存，暂未发现游戏角色；下次面板或记录查询会重新同步。`
+        }
         await accounts.save(...owner, ltuid, cookie, roles)
-        await accounts.saveToken(...owner, ltuid, token)
         return `通行证 ${ltuid} 已绑定：${roles.map(role => `${role.game} ${role.uid}`).join('、')}。`
       }
       return '扫码超时，请重新发起。'
@@ -323,24 +354,33 @@ export function apply(ctx: Context, config: Config) {
     return await accounts.removeToken(...owner, ltuid) ? 'SToken 已删除，游戏 CK 不受影响。' : '未找到该 SToken。'
   })
 
-  ctx.command('mys.auto <ltuid:string> <state:string>', '启停当前通行证游戏自动签到').action(async ({ session }, ltuid, state) => {
+  ctx.command('mys.auto <stateOrLtuid:string> [ltuidOrState:string]', '启停当前通行证游戏自动签到').action(async ({ session }, first, second) => {
     if (!session) return
     const owner = identity(session)
-    if (!owner || !passportId.test(ltuid || '') || !['on', 'off'].includes(state)) return '用法：私聊 mys.auto 通行证ID on|off。'
+    if (!owner) return '仅支持私聊。'
+    const selected = await togglePassport(owner, first, second, 'cookie')
+    if ('error' in selected) return selected.error
+    const { ltuid, state } = selected
     return await accounts.setEnabled(...owner, ltuid, state === 'on') ? '自动签到设置已更新。' : '未找到该通行证。'
   })
 
-  ctx.command('mys.community.auto <ltuid:string> <state:string>', '启停独立定时社区签到').action(async ({ session }, ltuid, state) => {
+  ctx.command('mys.community.auto <stateOrLtuid:string> [ltuidOrState:string]', '启停独立定时社区签到').action(async ({ session }, first, second) => {
     if (!session) return
     const owner = identity(session)
-    if (!owner || !passportId.test(ltuid || '') || !['on', 'off'].includes(state)) return '用法：私聊 mys.community.auto 通行证ID on|off。'
+    if (!owner) return '仅支持私聊。'
+    const selected = await togglePassport(owner, first, second, 'stoken')
+    if ('error' in selected) return selected.error
+    const { ltuid, state } = selected
     return await accounts.setCommunityEnabled(...owner, ltuid, state === 'on') ? `社区独立定时签到已${state === 'on' ? '开启，跟随模式已关闭' : '关闭'}。` : '未找到该通行证的 SToken。'
   })
 
-  ctx.command('mys.community.follow <ltuid:string> <state:string>', '启停跟随游戏签到的社区签到').action(async ({ session }, ltuid, state) => {
+  ctx.command('mys.community.follow <stateOrLtuid:string> [ltuidOrState:string]', '启停跟随游戏签到的社区签到').action(async ({ session }, first, second) => {
     if (!session) return
     const owner = identity(session)
-    if (!owner || !passportId.test(ltuid || '') || !['on', 'off'].includes(state)) return '用法：私聊 mys.community.follow 通行证ID on|off。'
+    if (!owner) return '仅支持私聊。'
+    const selected = await togglePassport(owner, first, second, 'stoken')
+    if ('error' in selected) return selected.error
+    const { ltuid, state } = selected
     return await accounts.setFollowMissions(...owner, ltuid, state === 'on') ? `跟随游戏的社区签到已${state === 'on' ? '开启，独立定时已关闭' : '关闭'}。` : '未找到该通行证的 SToken。'
   })
 
@@ -390,40 +430,39 @@ export function apply(ctx: Context, config: Config) {
     return output.join('\n')
   })
 
-  ctx.command('mys.record <game:string> <type:string> [uid:string] [period:string]', '查询当前游戏 UID 的记录').action(async ({ session }, game, type, uid, period) => {
+  ctx.command('mys.record <game:string> [type:string] [uid:string] [period:string]', '查询当前游戏 UID 的记录').action(async ({ session }, game, type = 'overview', uid, period) => {
     if (!session) return
-    const owner = identity(session)
-    if (!owner || !(game in recordTypes) || !type || !['1', '2', '3', undefined].includes(period)) return '用法：私聊 mys.record 游戏代号 类型 [UID] [1|2|3]。'
-    const roles = (await accounts.roles(...owner)).filter(role => role.game === game)
+    const owner = identity(session, true)
+    if (!owner || !Object.hasOwn(recordTypes, game) || !['1', '2', '3', undefined].includes(period)) return '用法：mys.record 游戏代号 [类型] [UID] [1|2|3]。'
+    const roles = await queryRoles(owner, game)
     if (['1', '2', '3'].includes(uid || '') && !period) {
       period = uid
       uid = undefined
     }
-    const role = uid ? roles.find(role => role.uid === uid) : roles.find(role => role.current)
+    const role = uid ? roles.find(role => role.uid === uid) : roles.find(role => role.current) || roles[0]
     if (!role) return '没有此游戏的当前 UID 或指定 UID 未绑定。'
     if (!Object.hasOwn(recordTypes[game as keyof typeof recordTypes], type)) return `可用类型：${Object.keys(recordTypes[game as keyof typeof recordTypes]).join('、')}。`
     try {
-      const summary = await accounts.use(...owner, role.ltuid, 'ck', async cookie => records.query(role, cookie, type, period === '2' ? 2 : period === '3' ? 3 : 1, await refreshDevice(...owner, role.ltuid, role.region)))
-      if (type !== 'panel' || /失败|无法|未能|没有|不支持/.test(summary)) return summary
-      const structured = await accounts.use(...owner, role.ltuid, 'ck', async cookie => records.queryPanel(role, cookie, await refreshDevice(...owner, role.ltuid, role.region)))
-      if (typeof structured === 'string') return structured
-      const snapshot = await panel.save(role, `${game === 'gs' ? '原神' : '星穹铁道'}角色面板`, panelSummary(structured), structured)
-      try {
-        return await panel.render(snapshot)
-      } catch {
-        return `${summary}\n面板快照已保存，但 Puppeteer 渲染不可用。`
+      if (['gs', 'sr'].includes(game) && ['panel', 'overview'].includes(type)) {
+        const overview = await accounts.use(...owner, role.ltuid, 'ck', async cookie => records.queryAccount(role, cookie, await refreshDevice(...owner, role.ltuid, role.region), type === 'overview'))
+        if (typeof overview === 'string') return overview
+        if (type === 'panel') return await panel.renderAccount(overview, session.author.avatar || session.event.user?.avatar)
+        if (game !== 'sr') return formatAccountOverview(overview)
+        overview.stamina = await accounts.use(...owner, role.ltuid, 'ck', async cookie => records.queryStamina(role, cookie, await refreshDevice(...owner, role.ltuid, role.region)))
+        return await panel.renderRecordOverview(overview, session.author.avatar || session.event.user?.avatar)
       }
+      return await accounts.use(...owner, role.ltuid, 'ck', async cookie => records.query(role, cookie, type, period === '2' ? 2 : period === '3' ? 3 : 1, await refreshDevice(...owner, role.ltuid, role.region)))
     } catch (error) {
       return `记录查询失败：${error instanceof Error ? error.message : '请检查凭证、网络与数据公开权限。'}`
     }
   })
 
-  ctx.command('mys.character <game:string> <character:text> [uid:string]', '查询指定角色的详细面板').action(async ({ session }, game, character, uid) => {
+  ctx.command('mys.character <game:string> <character:string> [uid:string]', '查询指定角色的详细面板').action(async ({ session }, game, character, uid) => {
     if (!session) return
-    const owner = identity(session)
-    if (!owner || !['gs', 'sr'].includes(game) || !character?.trim()) return '用法：私聊 mys.character gs|sr 角色名 [UID]。'
-    const roles = (await accounts.roles(...owner)).filter(role => role.game === game)
-    const role = uid ? roles.find(item => item.uid === uid) : roles.find(item => item.current)
+    const owner = identity(session, true)
+    if (!owner || !['gs', 'sr'].includes(game) || !character?.trim()) return '用法：mys.character gs|sr 角色名 [UID]。'
+    const roles = await queryRoles(owner, game)
+    const role = uid ? roles.find(item => item.uid === uid) : roles.find(item => item.current) || roles[0]
     if (!role) return '没有此游戏的当前 UID 或指定 UID 未绑定。'
     try {
       const structured = await accounts.use(...owner, role.ltuid, 'ck', async cookie => records.queryPanel(role, cookie, await refreshDevice(...owner, role.ltuid, role.region), character.trim()))
@@ -435,23 +474,19 @@ export function apply(ctx: Context, config: Config) {
     }
   })
 
-  ctx.command('mys.panel <game:string> [uid:string]', '查看已保存的图片面板').action(async ({ session }, game, uid) => {
+  ctx.command('mys.panel [game:string] [uid:string]', '查看游戏账号头像、UID 与角色立绘，默认星穹铁道').action(async ({ session }, game = 'sr', uid) => {
     if (!session) return
-    const owner = identity(session)
-    if (!owner || !['gs', 'sr'].includes(game)) return '用法：私聊 mys.panel gs|sr [UID]。'
-    const roles = (await accounts.roles(...owner)).filter(role => role.game === game)
-    const role = uid ? roles.find(role => role.uid === uid) : roles.find(role => role.current)
+    const owner = identity(session, true)
+    if (!owner || !['gs', 'sr'].includes(game)) return '用法：mys.panel [gs|sr] [UID]。'
+    const roles = await queryRoles(owner, game)
+    const role = uid ? roles.find(role => role.uid === uid) : roles.find(role => role.current) || roles[0]
     if (!role) return '没有已绑定的游戏角色。'
     try {
-      let snapshot = await panel.get(...owner, role)
-      if (!snapshot) {
-        const structured = await accounts.use(...owner, role.ltuid, 'ck', async cookie => records.queryPanel(role, cookie, await refreshDevice(...owner, role.ltuid, role.region)))
-        if (typeof structured === 'string') return structured
-        snapshot = await panel.save(role, `${game === 'gs' ? '原神' : '星穹铁道'}角色面板`, panelSummary(structured), structured)
-      }
-      return await panel.render(snapshot)
+      const overview = await accounts.use(...owner, role.ltuid, 'ck', async cookie => records.queryAccount(role, cookie, await refreshDevice(...owner, role.ltuid, role.region)))
+      if (typeof overview === 'string') return overview
+      return await panel.renderAccount(overview, session.author.avatar || session.event.user?.avatar)
     } catch (error) {
-      return `首次查询或面板渲染失败：${error instanceof Error ? error.message : '请检查凭证、网络、数据公开权限及 Puppeteer 服务。'}`
+      return `账号概览查询或渲染失败：${error instanceof Error ? error.message : '请检查凭证、网络、数据公开权限及 Puppeteer 服务。'}`
     }
   })
 

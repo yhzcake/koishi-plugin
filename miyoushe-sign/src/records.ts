@@ -1,4 +1,4 @@
-import { createClient } from './client'
+import { createClient, Result } from './client'
 import { DeviceInfo } from './vault'
 import { GameRole } from './accounts'
 import { starRailData } from './starrail-data'
@@ -111,6 +111,24 @@ export interface PanelData {
   uid: string
   server: string
   characters: PanelCharacter[]
+}
+
+export interface AccountOverviewCharacter {
+  id: string
+  name: string
+  avatar?: string
+}
+
+export interface AccountOverview {
+  game: 'gs' | 'sr'
+  uid: string
+  nickname: string
+  avatar?: string
+  characters: AccountOverviewCharacter[]
+  level?: string
+  server?: string
+  stamina?: Record<string, unknown>
+  challenges?: Record<string, Record<string, unknown>>
 }
 
 interface MihomoPlayerData {
@@ -349,6 +367,30 @@ function imageOf(value: unknown) {
     const result = assetUrl(value[key])
     if (result) return result
   }
+}
+
+function accountAvatar(value: unknown) {
+  if (typeof value === 'string') return assetUrl(value)
+  if (!isRecord(value)) return undefined
+  for (const key of ['avatar', 'avatar_url', 'avatar_icon', 'avatar_icon_url', 'avatar_side_icon', 'game_head_icon', 'head_icon', 'icon', 'icon_url', 'portrait', 'image', 'url']) {
+    const candidate = value[key]
+    const result = assetUrl(candidate) || (isRecord(candidate) ? accountAvatar(candidate) : undefined)
+    if (result) return result
+  }
+}
+
+function accountCharacterAvatar(game: AccountOverview['game'], character: Record<string, unknown>, id: string) {
+  for (const source of [character, character.avatar, character.icon]) {
+    if (!isRecord(source)) continue
+    for (const key of ['portrait', 'preview', 'image', 'avatar_url', 'icon_url', 'icon', 'url']) {
+      const candidate = isRecord(source[key]) ? imageOf(source[key]) : assetUrl(source[key])
+      if (candidate) return candidate
+    }
+  }
+  if (!/^\d+$/.test(id)) return undefined
+  return game === 'sr'
+    ? assetUrl(`image/character/${id}_Splash.png`) || starRailIcon('character', id)
+    : `https://enka.network/ui/UI_Gacha_AvatarImg_${encodeURIComponent(id)}.png`
 }
 
 const starRailAssetBase = 'https://raw.githubusercontent.com/Mar-7th/StarRailRes/master/'
@@ -891,21 +933,17 @@ export function formatRecord(label: string, data: unknown) {
   const fields = ['nickname', 'name', 'level', 'active_days', 'achievement_number', 'reliquaries', 'chests', 'total_star', 'max_floor', 'max_score', 'total_battle_times', 'has_data']
   const lines = fields.flatMap(key => {
     const value = text(data[key])
-    return value ? [`${key}：${value}`] : []
+    return value && value !== '[object Object]' ? [`${key}：${value}`] : []
   })
   const roles = roleList(data)
-  if (roles.length) lines.push(`角色数量：${roles.length}`, ...roles.slice(0, 15).map(role => {
-    const name = text(role.name) || text(role.avatar_name) || text(role.id) || '未知角色'
-    const level = text(role.level)
-    return `${name}${level ? ` Lv.${level}` : ''}`
-  }))
+  if (roles.length || Array.isArray(data.avatar_list) || Array.isArray(data.list)) lines.push(`角色数量：${roles.length}`)
   for (const key of ['all_floor', 'floors', 'floor_list']) {
     if (!Array.isArray(data[key])) continue
     const floors = (data[key] as unknown[]).filter(isRecord)
     lines.push(`关卡数量：${floors.length}`)
     for (const floor of floors.slice(0, 12)) {
       const name = text(floor.name) || text(floor.floor_name) || text(floor.index) || text(floor.floor) || '关卡'
-      const score = text(floor.star_num) || text(floor.score) || text(floor.max_score)
+      const score = text(floor.star_num) || text(floor.star) || text(floor.score) || text(floor.max_score)
       lines.push(`${name}${score ? `：${score}` : ''}`)
     }
     break
@@ -914,53 +952,211 @@ export function formatRecord(label: string, data: unknown) {
     if (isRecord(data[key])) {
       for (const field of fields) {
         const value = text((data[key] as Record<string, unknown>)[field])
-        if (value) lines.push(`${field}：${value}`)
+        if (value && value !== '[object Object]') lines.push(`${field}：${value}`)
       }
     }
   }
   return lines.length ? `${label}\n${lines.slice(0, 22).join('\n')}` : `${label}：接口返回数据，但暂无可展示的摘要。`
 }
 
-function formatChallenge(label: string, data: unknown, schedule: 1 | 2 | 3) {
+function lastChallenge(data: unknown, schedule: 1 | 2 | 3 = 1) {
+  if (!isRecord(data)) return '挑战数据缺失。'
+  if (Array.isArray(data.challenge_peak_records)) {
+    const peak = data.challenge_peak_records[schedule === 2 ? 1 : 0]
+    if (!isRecord(peak)) return '挑战数据缺失。'
+    const latest = (items: unknown[], names: unknown[]) => {
+      const candidates: { record: Record<string, unknown>; name: string; time?: number }[] = []
+      for (let index = 0; index < items.length; index++) {
+        const record = items[index]
+        if (!isRecord(record) || record.has_challenge_record !== true && record.is_fast !== true) continue
+        const info = names[index]
+        const name = isRecord(info) ? text(info.name) : undefined
+        candidates.push({ record, name: name || `骑士关卡${index + 1}`, time: Date.parse(String(record.challenge_time || '')) })
+      }
+      return candidates.reduce((selected, candidate) => candidate.time !== undefined && Number.isFinite(candidate.time) && (selected.time === undefined || !Number.isFinite(selected.time) || candidate.time > selected.time) ? candidate : selected, candidates[0])
+    }
+    const boss = isRecord(peak.boss_record) ? peak.boss_record : undefined
+    const mobs = Array.isArray(peak.mob_records) ? peak.mob_records : []
+    const infos = Array.isArray(peak.mob_infos) ? peak.mob_infos : []
+    const lines: string[] = []
+    if (boss?.has_challenge_record === true) {
+      const info = isRecord(peak.boss_info) ? peak.boss_info : undefined
+      lines.push(`王棋：${text(info?.name_mi18n) || '未知'}；该关星数：${text(boss.star_num) ?? '未知'}`)
+    } else if (boss && boss.has_challenge_record === false) {
+      lines.push('王棋：暂无挑战记录。')
+    }
+    const mob = latest(mobs, infos)
+    if (mob) lines.push(`骑士：${mob.name}；该关星数：${text(mob.record.star_num) ?? '未知'}`)
+    else if (mobs.length) lines.push('骑士：暂无挑战记录。')
+    return lines.length ? lines.join('；') : '挑战数据缺失。'
+  }
+  const floors = Array.isArray(data.all_floor_detail) ? data.all_floor_detail.filter(isRecord) : []
+  const maxFloor = text(data.max_floor)
+  const maxFloorNumber = maxFloor ? Number(maxFloor.replace(/[^0-9]/g, '')) : undefined
+  const floor = floors.find(item => text(item.name) === maxFloor)
+    || floors.find(item => Number(text(item.name)?.replace(/[^0-9]/g, '')) === maxFloorNumber)
+  if (!floor) return maxFloor === '0' ? '暂无挑战记录。' : maxFloor ? `最后关：${maxFloor}；该关星数：未知` : floors.length ? '最后关：未知；该关星数：未知' : '挑战数据缺失。'
+  return `最后关：${text(floor.name) || maxFloor || '未知'}；该关星数：${text(floor.star_num) ?? '未知'}`
+}
+
+function formatChallenge(label: string, data: unknown, schedule: 1 | 2 | 3, type: string) {
   if (!isRecord(data)) return `${label}：暂无挑战记录。`
   const lines: string[] = []
+  const peaks = Array.isArray(data.challenge_peak_records) ? data.challenge_peak_records : []
+  if (type === 'anomaly') {
+    const peak = peaks[schedule === 2 ? 1 : 0]
+    if (!isRecord(peak)) return `${label}\n暂无王棋记录。`
+    const group = isRecord(peak.group) ? peak.group : {}
+    const boss = isRecord(peak.boss_record) ? peak.boss_record : {}
+    const bossInfo = isRecord(peak.boss_info) ? peak.boss_info : {}
+    const groupName = text(group.name_mi18n) || text(group.name)
+    const bossName = text(bossInfo.name_mi18n) || text(bossInfo.name)
+    const bossStars = text(peak.boss_stars) || text(boss.star_num)
+    const mobStars = text(peak.mob_stars)
+    const battleCount = isRecord(data.challenge_peak_best_record_brief) ? text(data.challenge_peak_best_record_brief.total_battle_num) : undefined
+    if (groupName) lines.push(`周期：${groupName}`)
+    if (bossName || bossStars) lines.push(`王棋：${bossName || '已记录'}${bossStars ? `（${bossStars} 星）` : ''}`)
+    if (mobStars) lines.push(`骑士：${mobStars} 星`)
+    if (battleCount) lines.push(`战斗次数：${battleCount}`)
+    return `${label}\n${lines.length ? lines.join('\n') : '暂无王棋记录。'}`
+  }
   const groups = Array.isArray(data.groups) ? data.groups.filter(isRecord) : []
   const group = groups.find(item => item.status === (schedule === 1 ? 'New' : 'End')) || groups[0]
   if (group) {
-    for (const key of ['name', 'begin_time', 'end_time', 'max_score', 'total_star']) {
-      const value = text(group[key])
-      if (value) lines.push(`${key}：${value}`)
-    }
+    const name = text(group.name)
+    const begin = text(group.begin_time)
+    const end = text(group.end_time)
+    if (name) lines.push(`赛季：${name}`)
+    if (begin || end) lines.push(`开放时间：${begin || '未知'} 至 ${end || '未知'}`)
   }
-  for (const key of ['max_floor', 'total_star', 'max_score']) {
-    const value = text(data[key])
-    if (value) lines.push(`${key}：${value}`)
-  }
+  const totalStars = text(data.total_star) || text(group?.total_star)
+  const maxScore = text(data.max_score) || text(group?.max_score)
+  if (totalStars) lines.push(`总星数：${totalStars}`)
+  if (maxScore) lines.push(`总分：${maxScore}`)
   const details = Array.isArray(data.all_floor_detail) ? data.all_floor_detail.filter(isRecord) : []
   if (details.length) {
-    lines.push(`关卡数量：${details.length}`)
-    for (const floor of details.slice(0, 12)) {
-      const name = text(floor.name) || text(floor.floor_name) || text(floor.index) || '关卡'
+    const maxFloor = text(data.max_floor)
+    const progress = maxFloor ? details.find(item => {
+      const name = text(item.name) || text(item.floor) || ''
+      return name === maxFloor || name.startsWith(maxFloor) || maxFloor.startsWith(name)
+    }) : undefined
+    const selected = progress ? [progress] : details.slice(0, 12)
+    for (const floor of selected) {
+      const name = text(floor.name) || text(floor.floor_name) || text(floor.floor) || text(floor.index) || '关卡'
       const nodes = ['node_1', 'node_2', 'node_3'].map(key => floor[key]).filter(isRecord)
       const scores = nodes.map(node => Number(node.score)).filter(Number.isFinite)
       const score = text(floor.score) || (scores.length ? String(scores.reduce((sum, item) => sum + item, 0)) : undefined)
-      lines.push(`${name}${score ? `：${score}` : ''}`)
+      const stars = text(floor.star_num) || text(floor.star) || text(floor.total_star)
+      lines.push(`${maxFloor ? '最高通关' : '关卡'}：${name}${stars ? `（${stars} 星）` : ''}${score ? `，得分 ${score}` : ''}`)
     }
+  } else if (text(data.max_floor)) {
+    lines.push(`最高通关：${text(data.max_floor)}`)
   }
-  const peaks = Array.isArray(data.challenge_peak_records) ? data.challenge_peak_records.filter(isRecord) : []
-  const peak = peaks[schedule === 1 ? 0 : schedule === 2 ? 1 : 2]
-  if (peak) {
-    const value = text(peak.score) || text(peak.total_score)
-    lines.push(`异相记录${value ? `：${value}` : ''}`)
-    const mobs = Array.isArray(peak.mob_records) ? peak.mob_records : []
-    lines.push(`骑士记录：${mobs.length}`)
+  return `${label}${lines.length ? `\n${lines.slice(0, 22).join('\n')}` : ''}`
+}
+
+function recordError(result: Result) {
+  if (result.retcode === 10102) return '查询失败：该角色的米游社数据未公开。'
+  if (result.retcode === 10101) return '查询失败：今日查询次数已达上限。'
+  if (result.retcode === 1008) return '查询失败：请先在米游社绑定角色。'
+  if ([1034, 10035].includes(result.retcode)) return '查询失败：平台要求验证码，请在官方客户端完成验证。'
+  if ([5003, 10041].includes(result.retcode)) return '查询失败：账号或设备状态异常，请在官方客户端检查。'
+  if (result.retcode === -10001 || result.retcode === 10001) {
+    const message = typeof result.message === 'string' ? result.message : ''
+    if (/device|fingerprint|risk|forbidden|风控|设备/i.test(message)) return '查询失败：请求被设备或风控策略拒绝，请先在官方客户端打开对应角色页面后重试。'
+    if (/登录|log[ -]?in|not logged in|(?:token|cookie).*(?:expired|invalid)|(?:expired|invalid).*(?:token|cookie)/i.test(message)) return '查询失败：Cookie 或登录状态已失效，请重新绑定米游社凭证。'
+    return `查询失败（${result.retcode}）：记录接口拒绝请求，原因未知，请在官方客户端检查账号状态。`
   }
-  return lines.length ? `${label}\n${lines.slice(0, 22).join('\n')}` : formatRecord(label, data)
+  return `查询失败（${result.retcode}），请检查角色展示权限及官方客户端状态。`
+}
+
+export function formatAccountOverview(data: AccountOverview) {
+  const lines = [
+    `${data.game === 'gs' ? '原神' : '星穹铁道'}账号概览`,
+    `UID：${data.uid}`,
+    `昵称：${data.nickname}`,
+  ]
+  lines.push(...data.characters.map(character => character.name))
+  return lines.join('\n')
 }
 
 export function createRecords(client: ReturnType<typeof createClient>, cache?: StaticCache) {
   const cn = (region: string) => region.startsWith('cn_') || region.endsWith('_cn')
   const host = (region: string) => cn(region) ? 'https://api-takumi-record.mihoyo.com' : 'https://sg-act-public-api.hoyolab.com'
+
+  async function queryAccount(account: GameRole, secret: string, device?: DeviceInfo, includeChallenges = false): Promise<AccountOverview | string> {
+    if (account.game !== 'gs' && account.game !== 'sr') return '该游戏不支持账号概览。'
+    const owned = await client.discover(secret)
+    if (!owned.some(role => role.game === account.game && role.uid === account.uid && role.region === account.region)) {
+      return '查询失败：当前凭证未绑定该游戏 UID，拒绝请求。'
+    }
+    const game = account.game
+    const prefix = game === 'gs' ? '/game_record/app/genshin/api/' : '/game_record/app/hkrpg/api/'
+    const params = new URLSearchParams({ role_id: account.uid, server: account.region })
+    async function section(path: string, extra?: Record<string, string>, body?: object): Promise<{ data?: Record<string, unknown>; error?: string }> {
+      try {
+        const query = new URLSearchParams(params)
+        for (const [key, value] of Object.entries(extra || {})) query.set(key, value)
+        const result = await client.record(`${host(account.region)}${prefix}${path}${body ? '' : `?${query}`}`, secret, body, device)
+        return result.retcode === 0 ? { data: result.data } : { error: recordError(result) }
+      } catch {
+        return { error: '查询失败：接口请求异常。' }
+      }
+    }
+    const index = await section('index')
+    const data = isRecord(index.data) ? index.data : {}
+    const role = isRecord(data.role) ? data.role : {}
+    const profile = game === 'sr' ? await section('role/basicInfo') : undefined
+    const profileData = isRecord(profile?.data) ? profile.data : {}
+    const profileRole = isRecord(profileData.role) ? profileData.role : {}
+    const roleSection = game === 'gs'
+      ? await section('character/list', undefined, { role_id: account.uid, server: account.region })
+      : await section('avatar/basic')
+    const characters = roleList(roleSection.data)
+    const overview: AccountOverview = {
+      game,
+      uid: account.uid,
+      nickname: text(role.nickname) || text(data.nickname) || text(profileRole.nickname) || text(profileData.nickname) || '未知',
+      avatar: accountAvatar(role) || accountAvatar(data) || accountAvatar(profileRole) || accountAvatar(profileData),
+      level: text(role.level) || text(data.level) || text(profileRole.level) || text(profileData.level),
+      server: text(profileData.region_name) || text(profileRole.region_name) || account.region,
+      characters: characters.map(character => {
+        const id = valueOf(character, ['id', 'avatar_id', 'character_id']) || '未知ID'
+        return {
+          id,
+          name: valueOf(character, ['name', 'avatar_name', 'character_name']) || '未知昵称',
+          avatar: accountCharacterAvatar(game, character, id),
+        }
+      }),
+    }
+    if (game === 'sr' && includeChallenges) {
+      const challengeTypes = ['forgotten', 'fiction', 'apocalypse', 'anomaly'] as const
+      const challengeResults = await Promise.all(challengeTypes.map(async type => {
+        const query = new URLSearchParams({ role_id: account.uid, schedule_type: '1', server: account.region })
+        try {
+          const result = await client.record(`${host(account.region)}${prefix}${recordTypes.sr[type]}?${query}`, secret, undefined, device)
+          return result.retcode === 0 && isRecord(result.data) ? [type, result.data] as const : undefined
+        } catch {
+          return undefined
+        }
+      }))
+      overview.challenges = Object.fromEntries(challengeResults.filter(item => item !== undefined))
+    }
+    return overview
+  }
+
+  async function queryStamina(account: GameRole, secret: string, device?: DeviceInfo) {
+    if (account.game !== 'sr') return undefined
+    const prefix = '/game_record/app/hkrpg/api/'
+    const params = new URLSearchParams({ role_id: account.uid, server: account.region })
+    try {
+      const result = await client.record(`${host(account.region)}${prefix}note?${params}`, secret, undefined, device)
+      if (result.retcode !== 0) return undefined
+      return isRecord(result.data) ? result.data : undefined
+    } catch {
+      return undefined
+    }
+  }
 
   async function warmStarRailData(data: unknown) {
     if (!cache || !isRecord(data)) return
@@ -1057,7 +1253,7 @@ export function createRecords(client: ReturnType<typeof createClient>, cache?: S
     if (game === 'gs') {
       body = { role_id: account.uid, server: account.region }
       const list = await client.record(`${host(account.region)}${prefix}${recordTypes.gs.roles}`, secret, body, device)
-      if (list.retcode !== 0) return `角色列表查询失败（${list.retcode}）。`
+      if (list.retcode !== 0) return recordError(list)
       const ids = roleList(list.data).map(role => role.id).filter(id => typeof id === 'number' || typeof id === 'string').slice(0, 60)
       if (!ids.length) return '没有可更新的角色面板。'
       body = { ...body, character_ids: ids }
@@ -1065,19 +1261,7 @@ export function createRecords(client: ReturnType<typeof createClient>, cache?: S
       url = `${hostUrl}?${params}`
     }
     const result = await client.record(url, secret, body, device)
-    if (result.retcode !== 0) {
-      if (result.retcode === 10102) return '查询失败：该角色的米游社数据未公开。'
-      if (result.retcode === 10101) return '查询失败：今日查询次数已达上限。'
-      if ([1034, 10035].includes(result.retcode)) return '查询失败：平台要求验证码，请在官方客户端完成验证。'
-      if ([5003, 10041].includes(result.retcode)) return '查询失败：账号或设备状态异常，请在官方客户端检查。'
-      if (result.retcode === -10001 || result.retcode === 10001) {
-        const message = result.message || ''
-        if (/登录|login|token|cookie/i.test(message)) return '查询失败：Cookie 或登录状态已失效，请重新绑定米游社凭证。'
-        if (/device|fingerprint|risk|forbidden|风控|设备|异常/i.test(message)) return '查询失败：请求被设备或风控策略拒绝，请先在官方客户端打开对应角色页面后重试。'
-        return `查询失败（${result.retcode}）：记录接口拒绝请求，请检查设备指纹、角色展示权限及米游社客户端状态。`
-      }
-      return `查询失败（${result.retcode}），请检查角色展示权限及官方客户端状态。`
-    }
+    if (result.retcode !== 0) return recordError(result)
     if (game === 'sr') {
       await warmStarRailData(result.data)
       if (cache && isRecord(result.data)) {
@@ -1111,10 +1295,15 @@ export function createRecords(client: ReturnType<typeof createClient>, cache?: S
     const params = new URLSearchParams({ role_id: account.uid, server: account.region })
     if (game === 'sr' && type === 'overview') {
       const index = await client.record(`${url}?${params}`, secret, undefined, device)
-      if (index.retcode !== 0) return `概览查询失败（${index.retcode}）。`
-      const brief = await client.record(`${host(account.region)}${prefix}challenge_brief?${params}`, secret, undefined, device)
-      if (brief.retcode !== 0) return `挑战摘要查询失败（${brief.retcode}）。`
+      if (index.retcode !== 0) return recordError(index)
       const summary = formatRecord('sr overview', index.data)
+      let brief: Result
+      try {
+        brief = await client.record(`${host(account.region)}${prefix}challenge_brief?${params}`, secret, undefined, device)
+      } catch {
+        return `${summary}\n挑战摘要：查询失败：接口请求异常。`
+      }
+      if (brief.retcode !== 0) return `${summary}\n挑战摘要：${recordError(brief)}`
       const schedules = Array.isArray(brief.data?.list) ? brief.data.list.filter(isRecord) : []
       const lines = schedules.slice(0, 3).map(item => {
         const current = isRecord(item.cur_schedule) ? item.cur_schedule : {}
@@ -1127,7 +1316,7 @@ export function createRecords(client: ReturnType<typeof createClient>, cache?: S
       body = { role_id: account.uid, server: account.region }
       if (type === 'panel') {
         const list = await client.record(`${host(account.region)}${prefix}${paths.roles}`, secret, body, device)
-        if (list.retcode !== 0) return `角色列表查询失败（${list.retcode}）。`
+        if (list.retcode !== 0) return recordError(list)
         const ids = roleList(list.data).map(role => role.id).filter(id => typeof id === 'number' || typeof id === 'string').slice(0, 60)
         if (!ids.length) return '没有可更新的角色面板。'
         body = { ...body, character_ids: ids }
@@ -1140,33 +1329,16 @@ export function createRecords(client: ReturnType<typeof createClient>, cache?: S
         params.delete('server')
         for (const [key, value] of ordered) params.set(key, value)
       }
-      if (['forgotten', 'fiction', 'apocalypse', 'anomaly', 'abyss'].includes(type)) params.set('schedule_type', String(schedule))
-      if (game === 'sr' && ['forgotten', 'fiction', 'apocalypse', 'anomaly'].includes(type)) {
-        params.set('isPrev', '')
-        params.set('need_all', 'true')
+      if (['forgotten', 'fiction', 'apocalypse', 'anomaly', 'abyss'].includes(type)) {
+        const ordered = new URLSearchParams({ role_id: account.uid, schedule_type: String(schedule), server: account.region })
+        params.delete('role_id')
+        params.delete('server')
+        for (const [key, value] of ordered) params.set(key, value)
       }
       if (game === 'gs' && ['theater', 'peril'].includes(type)) params.set('need_detail', 'true')
     }
-    let result = await client.record(body ? url : `${url}?${params}`, secret, body, device)
-    if (result.retcode === 1034 && game === 'sr' && ['forgotten', 'fiction', 'apocalypse', 'anomaly'].includes(type)) {
-      params.delete('isPrev')
-      params.delete('need_all')
-      result = await client.record(`${url}?${params}`, secret, undefined, device)
-    }
-    if (result.retcode !== 0) {
-      if (result.retcode === 10102) return '查询失败：该角色的米游社数据未公开。'
-      if (result.retcode === 10101) return '查询失败：今日查询次数已达上限。'
-      if (result.retcode === 1008) return '查询失败：请先在米游社绑定角色。'
-      if ([1034, 10035].includes(result.retcode)) return '查询失败：平台要求验证码，请在官方客户端完成验证。'
-      if ([5003, 10041].includes(result.retcode)) return '查询失败：账号或设备状态异常，请在官方客户端检查。'
-      if (result.retcode === -10001 || result.retcode === 10001) {
-        const message = result.message || ''
-        if (/登录|login|token|cookie/i.test(message)) return '查询失败：Cookie 或登录状态已失效，请重新绑定米游社凭证。'
-        if (/device|fingerprint|risk|forbidden|风控|设备|异常/i.test(message)) return '查询失败：请求被设备或风控策略拒绝，请先在官方客户端打开对应角色页面后重试。'
-        return `查询失败（${result.retcode}）：记录接口拒绝请求，请检查设备指纹、角色展示权限及米游社客户端状态。`
-      }
-      return `查询失败（${result.retcode}），请检查角色展示权限及官方客户端状态。`
-    }
+    const result = await client.record(body ? url : `${url}?${params}`, secret, body, device)
+    if (result.retcode !== 0) return recordError(result)
     if (type === 'panel' && character) {
       const selected = findRole(result.data, character)
       if (!selected) return `未找到角色“${character}”，请先使用 mys.record ${game} panel 查看角色名称。`
@@ -1174,9 +1346,9 @@ export function createRecords(client: ReturnType<typeof createClient>, cache?: S
     }
     const label = `${game} ${type}（${schedule === 2 ? '上期' : schedule === 3 ? '往期' : '本期'}）`
     return game === 'sr' && ['forgotten', 'fiction', 'apocalypse', 'anomaly'].includes(type)
-      ? formatChallenge(label, result.data, schedule)
+      ? formatChallenge(label, result.data, schedule, type)
       : formatRecord(label, result.data)
   }
 
-  return { query, queryPanel }
+  return { query, queryPanel, queryAccount, queryStamina }
 }

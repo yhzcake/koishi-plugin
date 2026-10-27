@@ -36,7 +36,7 @@ __export(src_exports, {
   name: () => name
 });
 module.exports = __toCommonJS(src_exports);
-var import_koishi = require("koishi");
+var import_koishi2 = require("koishi");
 var import_node_crypto5 = require("node:crypto");
 var import_qrcode = __toESM(require("qrcode"));
 
@@ -298,6 +298,7 @@ function createClient(ctx, timeout, interval) {
   let queue = Promise.resolve();
   const qrDeviceId = (0, import_node_crypto2.randomUUID)();
   const qrLifecycleId = (0, import_node_crypto2.randomUUID)();
+  const recordDeviceId = (0, import_node_crypto2.randomUUID)().replace(/-/g, "");
   async function request(url, secret, method, body, community = false, device) {
     const hostname = new URL(url).hostname;
     if (!["api-takumi.mihoyo.com", "sg-act-public-api.hoyolab.com", "bbs-api.miyoushe.com", "api-takumi-record.mihoyo.com", "sg-public-api.hoyolab.com", "passport-api.miyoushe.com", "public-data-api.mihoyo.com", "sg-public-data-api.hoyoverse.com"].includes(hostname)) {
@@ -352,7 +353,7 @@ function createClient(ctx, timeout, interval) {
         headers["x-rpc-csm_source"] = "myself";
         headers["x-rpc-platform"] = "android";
         headers["x-rpc-channel"] = overseas ? "google" : "miyousheluodi";
-        headers["x-rpc-sys_version"] = "13";
+        headers["x-rpc-sys_version"] = "12";
         headers.DS = recordDs(new URL(url).search.slice(1), body ? JSON.stringify(body) : "", hostname.endsWith("mihoyo.com"));
       } else if (community) {
         headers.DS = method === "POST" && body ? ds("t0qEgfub6cvueAPgR5m9aQWWVciEer7v", JSON.stringify(body)) : ds("WGtruoQrwczmsjLOPXzJLnaAYycsLavx");
@@ -360,19 +361,27 @@ function createClient(ctx, timeout, interval) {
         headers.DS = ds("jEpJb9rRARU2rXDA9qYbZ3selxkuct9a");
       }
       if (device?.deviceId) headers["x-rpc-device_id"] = device.deviceId;
+      else if (hostname === "api-takumi-record.mihoyo.com" || hostname === "sg-act-public-api.hoyolab.com" && url.includes("/game_record/")) headers["x-rpc-device_id"] = recordDeviceId;
       if (device?.deviceFp) headers["x-rpc-device_fp"] = device.deviceFp;
       if (device && (hostname === "api-takumi-record.mihoyo.com" || hostname.includes("public-data-api."))) {
         headers["x-rpc-device_name"] ||= "Sony XQ-BC52";
         headers["x-rpc-device_model"] ||= "XQ-BC52";
         headers["x-rpc-platform"] ||= "android";
-        headers["x-rpc-sys_version"] ||= "13";
+        headers["x-rpc-sys_version"] ||= "12";
+      }
+      const recordTraceId = (0, import_node_crypto2.randomUUID)();
+      if (hostname.includes("record") || hostname.includes("public-data")) {
+        const query = new URL(url).searchParams;
+        ctx.logger?.info(`[record-debug] trace=${recordTraceId} stage=request method=${method} path=${new URL(url).pathname} schedule=${query.get("schedule_type") || "-"} isPrev=${query.has("isPrev")} needAll=${query.get("need_all") || "-"} deviceId=${headers["x-rpc-device_id"] ? "present" : "missing"} deviceFp=${headers["x-rpc-device_fp"] ? "present" : "missing"} sys=${headers["x-rpc-sys_version"] || "-"} signgame=${headers["x-rpc-signgame"] || "-"} queueWaitMs=${delay}`);
       }
       const response = await ctx.http(url, { method, headers, data: body, timeout, redirect: "error" });
       if (response.status < 200 || response.status >= 300) throw new Error(`HTTP ${response.status}`);
       const result = response.data;
       if (!result || typeof result.retcode !== "number") throw new Error("\u63A5\u53E3\u54CD\u5E94\u683C\u5F0F\u9519\u8BEF");
-      if (process.env.MIYOUSHE_DEBUG_RECORD === "1" && (hostname.includes("record") || hostname.includes("public-data"))) {
-        ctx.logger.info(`[record-debug] ${method} ${new URL(url).pathname} retcode=${result.retcode} message=${result.message || "-"} device=${device?.deviceId ? "id" : "-"} fp=${device?.deviceFp ? "fp" : "-"}`);
+      if (hostname.includes("record") || hostname.includes("public-data")) {
+        const message = result.message || "";
+        const messageClass = /cookie|token|login|auth/i.test(message) ? "auth" : /device|fingerprint|设备/i.test(message) ? "device" : /captcha|verify|验证|验证码/i.test(message) ? "verification" : message ? "other" : "none";
+        ctx.logger?.info(`[record-debug] trace=${recordTraceId} stage=response path=${new URL(url).pathname} status=${response.status} retcode=${result.retcode} messageClass=${messageClass}`);
       }
       return result;
     });
@@ -402,14 +411,33 @@ function createClient(ctx, timeout, interval) {
       return token;
     },
     async exchangeCookie(secret, ltuid, gameBiz2 = "hk4e_cn") {
+      if (secret.length > 4096 || /[\r\n\x00-\x1f]/.test(secret) || !/^\d{1,20}$/.test(ltuid)) throw new Error("SToken \u6570\u636E\u4E0D\u5B8C\u6574\u3002");
+      const fields = new Map(secret.split(";").flatMap((segment) => {
+        const index = segment.indexOf("=");
+        return index < 1 ? [] : [[segment.slice(0, index).trim(), segment.slice(index + 1).trim()]];
+      }));
+      const stoken = fields.get("stoken") || fields.get("stoken_v2");
+      const ltoken = fields.get("ltoken");
+      const ltokenV2 = fields.get("ltoken_v2");
+      const ltmidV2 = fields.get("ltmid_v2");
+      const accountMidV2 = fields.get("account_mid_v2");
+      const identities = ["ltuid", "login_uid", "stuid", "account_id", "ltuid_v2", "account_id_v2"].map((name2) => fields.get(name2)).filter((value) => Boolean(value));
+      const validToken = /* @__PURE__ */ __name((value) => Boolean(value && /^[^;\s\x00-\x1f]{1,2048}$/.test(value)), "validToken");
+      if (!validToken(stoken) || !validToken(ltoken) && !validToken(ltokenV2) || !identities.length || identities.some((value) => value !== ltuid)) throw new Error("SToken \u6570\u636E\u4E0D\u5B8C\u6574\u3002");
+      if (ltokenV2 && !validToken(ltokenV2) || ltmidV2 && !validToken(ltmidV2) || accountMidV2 && !validToken(accountMidV2)) throw new Error("SToken \u6570\u636E\u4E0D\u5B8C\u6574\u3002");
       const overseas = gameBiz2.endsWith("_global");
       const host = overseas ? "https://sg-public-api.hoyolab.com" : "https://api-takumi.mihoyo.com";
       const result = await request(`${host}/auth/api/getCookieAccountInfoBySToken?game_biz=${encodeURIComponent(gameBiz2)}`, secret, overseas ? "POST" : "GET");
+      if (result.retcode !== 0) throw new Error("CK \u6362\u53D6\u5931\u8D25\u3002");
       const token = result.data?.cookie_token;
-      if (result.retcode !== 0 || typeof token !== "string" || !/^[^;\s\x00-\x1f]{1,2048}$/.test(token)) throw new Error("CK \u6362\u53D6\u5931\u8D25\u3002");
-      const ltoken = /(?:^|;)\s*ltoken=([^;]+)/.exec(secret)?.[1];
-      if (!ltoken || !/^[^;\s\x00-\x1f]{1,2048}$/.test(ltoken) || !/^\d{1,20}$/.test(ltuid)) throw new Error("SToken \u6570\u636E\u4E0D\u5B8C\u6574\u3002");
-      return `ltoken=${ltoken};ltuid=${ltuid};cookie_token=${token};account_id=${ltuid};`;
+      const tokenV2 = result.data?.cookie_token_v2;
+      if (tokenV2 !== void 0) {
+        if (typeof tokenV2 !== "string" || !validToken(tokenV2) || !ltokenV2 || !ltmidV2 || !accountMidV2) throw new Error("CK \u6362\u53D6\u5931\u8D25\u3002");
+        return `ltuid=${ltuid};account_mid_v2=${accountMidV2};cookie_token_v2=${tokenV2};ltoken_v2=${ltokenV2};ltmid_v2=${ltmidV2};`;
+      }
+      if (typeof token !== "string" || !/^[^;\s\x00-\x1f]{1,2048}$/.test(token)) throw new Error("CK \u6362\u53D6\u5931\u8D25\u3002");
+      if (!validToken(ltoken) && !validToken(ltokenV2)) throw new Error("CK \u6362\u53D6\u5931\u8D25\u3002");
+      return `${ltoken ? `ltoken=${ltoken};` : ""}${ltokenV2 ? `ltoken_v2=${ltokenV2};` : ""}${ltmidV2 ? `ltmid_v2=${ltmidV2};` : ""}${accountMidV2 ? `account_mid_v2=${accountMidV2};` : ""}ltuid=${ltuid};cookie_token=${token};account_id=${ltuid};`;
     },
     async fingerprint(deviceId, overseas, secret) {
       if (!/^[a-zA-Z0-9_-]{8,128}$/.test(deviceId)) throw new Error("\u8BBE\u5907 ID \u65E0\u6548\u3002");
@@ -443,6 +471,7 @@ function createClient(ctx, timeout, interval) {
             const region = String(item.region || "");
             return game && /^\d{1,20}$/.test(uid) && /^[a-zA-Z0-9_-]{2,40}$/.test(region) ? [{ game, uid, region }] : [];
           });
+          if (!roles.length) continue;
           return roles.filter((role, index) => roles.findIndex((other) => other.game === role.game && other.uid === role.uid && other.region === role.region) === index);
         } catch {
           continue;
@@ -3522,6 +3551,28 @@ function imageOf(value) {
   }
 }
 __name(imageOf, "imageOf");
+function accountAvatar(value) {
+  if (typeof value === "string") return assetUrl(value);
+  if (!isRecord(value)) return void 0;
+  for (const key of ["avatar", "avatar_url", "avatar_icon", "avatar_icon_url", "avatar_side_icon", "game_head_icon", "head_icon", "icon", "icon_url", "portrait", "image", "url"]) {
+    const candidate = value[key];
+    const result = assetUrl(candidate) || (isRecord(candidate) ? accountAvatar(candidate) : void 0);
+    if (result) return result;
+  }
+}
+__name(accountAvatar, "accountAvatar");
+function accountCharacterAvatar(game, character, id) {
+  for (const source2 of [character, character.avatar, character.icon]) {
+    if (!isRecord(source2)) continue;
+    for (const key of ["portrait", "preview", "image", "avatar_url", "icon_url", "icon", "url"]) {
+      const candidate = isRecord(source2[key]) ? imageOf(source2[key]) : assetUrl(source2[key]);
+      if (candidate) return candidate;
+    }
+  }
+  if (!/^\d+$/.test(id)) return void 0;
+  return game === "sr" ? assetUrl(`image/character/${id}_Splash.png`) || starRailIcon("character", id) : `https://enka.network/ui/UI_Gacha_AvatarImg_${encodeURIComponent(id)}.png`;
+}
+__name(accountCharacterAvatar, "accountCharacterAvatar");
 var starRailAssetBase = "https://raw.githubusercontent.com/Mar-7th/StarRailRes/master/";
 function assetUrl(value) {
   const path = typeof value === "string" ? value.trim() : void 0;
@@ -4030,21 +4081,17 @@ function formatRecord(label, data) {
   const fields = ["nickname", "name", "level", "active_days", "achievement_number", "reliquaries", "chests", "total_star", "max_floor", "max_score", "total_battle_times", "has_data"];
   const lines = fields.flatMap((key) => {
     const value = text(data[key]);
-    return value ? [`${key}\uFF1A${value}`] : [];
+    return value && value !== "[object Object]" ? [`${key}\uFF1A${value}`] : [];
   });
   const roles = roleList(data);
-  if (roles.length) lines.push(`\u89D2\u8272\u6570\u91CF\uFF1A${roles.length}`, ...roles.slice(0, 15).map((role) => {
-    const name2 = text(role.name) || text(role.avatar_name) || text(role.id) || "\u672A\u77E5\u89D2\u8272";
-    const level = text(role.level);
-    return `${name2}${level ? ` Lv.${level}` : ""}`;
-  }));
+  if (roles.length || Array.isArray(data.avatar_list) || Array.isArray(data.list)) lines.push(`\u89D2\u8272\u6570\u91CF\uFF1A${roles.length}`);
   for (const key of ["all_floor", "floors", "floor_list"]) {
     if (!Array.isArray(data[key])) continue;
     const floors = data[key].filter(isRecord);
     lines.push(`\u5173\u5361\u6570\u91CF\uFF1A${floors.length}`);
     for (const floor of floors.slice(0, 12)) {
       const name2 = text(floor.name) || text(floor.floor_name) || text(floor.index) || text(floor.floor) || "\u5173\u5361";
-      const score = text(floor.star_num) || text(floor.score) || text(floor.max_score);
+      const score = text(floor.star_num) || text(floor.star) || text(floor.score) || text(floor.max_score);
       lines.push(`${name2}${score ? `\uFF1A${score}` : ""}`);
     }
     break;
@@ -4053,7 +4100,7 @@ function formatRecord(label, data) {
     if (isRecord(data[key])) {
       for (const field of fields) {
         const value = text(data[key][field]);
-        if (value) lines.push(`${field}\uFF1A${value}`);
+        if (value && value !== "[object Object]") lines.push(`${field}\uFF1A${value}`);
       }
     }
   }
@@ -4061,47 +4108,166 @@ function formatRecord(label, data) {
 ${lines.slice(0, 22).join("\n")}` : `${label}\uFF1A\u63A5\u53E3\u8FD4\u56DE\u6570\u636E\uFF0C\u4F46\u6682\u65E0\u53EF\u5C55\u793A\u7684\u6458\u8981\u3002`;
 }
 __name(formatRecord, "formatRecord");
-function formatChallenge(label, data, schedule) {
+function formatChallenge(label, data, schedule, type) {
   if (!isRecord(data)) return `${label}\uFF1A\u6682\u65E0\u6311\u6218\u8BB0\u5F55\u3002`;
   const lines = [];
+  const peaks = Array.isArray(data.challenge_peak_records) ? data.challenge_peak_records : [];
+  if (type === "anomaly") {
+    const peak = peaks[schedule === 2 ? 1 : 0];
+    if (!isRecord(peak)) return `${label}
+\u6682\u65E0\u738B\u68CB\u8BB0\u5F55\u3002`;
+    const group2 = isRecord(peak.group) ? peak.group : {};
+    const boss = isRecord(peak.boss_record) ? peak.boss_record : {};
+    const bossInfo = isRecord(peak.boss_info) ? peak.boss_info : {};
+    const groupName = text(group2.name_mi18n) || text(group2.name);
+    const bossName = text(bossInfo.name_mi18n) || text(bossInfo.name);
+    const bossStars = text(peak.boss_stars) || text(boss.star_num);
+    const mobStars = text(peak.mob_stars);
+    const battleCount = isRecord(data.challenge_peak_best_record_brief) ? text(data.challenge_peak_best_record_brief.total_battle_num) : void 0;
+    if (groupName) lines.push(`\u5468\u671F\uFF1A${groupName}`);
+    if (bossName || bossStars) lines.push(`\u738B\u68CB\uFF1A${bossName || "\u5DF2\u8BB0\u5F55"}${bossStars ? `\uFF08${bossStars} \u661F\uFF09` : ""}`);
+    if (mobStars) lines.push(`\u9A91\u58EB\uFF1A${mobStars} \u661F`);
+    if (battleCount) lines.push(`\u6218\u6597\u6B21\u6570\uFF1A${battleCount}`);
+    return `${label}
+${lines.length ? lines.join("\n") : "\u6682\u65E0\u738B\u68CB\u8BB0\u5F55\u3002"}`;
+  }
   const groups = Array.isArray(data.groups) ? data.groups.filter(isRecord) : [];
   const group = groups.find((item) => item.status === (schedule === 1 ? "New" : "End")) || groups[0];
   if (group) {
-    for (const key of ["name", "begin_time", "end_time", "max_score", "total_star"]) {
-      const value = text(group[key]);
-      if (value) lines.push(`${key}\uFF1A${value}`);
-    }
+    const name2 = text(group.name);
+    const begin = text(group.begin_time);
+    const end = text(group.end_time);
+    if (name2) lines.push(`\u8D5B\u5B63\uFF1A${name2}`);
+    if (begin || end) lines.push(`\u5F00\u653E\u65F6\u95F4\uFF1A${begin || "\u672A\u77E5"} \u81F3 ${end || "\u672A\u77E5"}`);
   }
-  for (const key of ["max_floor", "total_star", "max_score"]) {
-    const value = text(data[key]);
-    if (value) lines.push(`${key}\uFF1A${value}`);
-  }
+  const totalStars = text(data.total_star) || text(group?.total_star);
+  const maxScore = text(data.max_score) || text(group?.max_score);
+  if (totalStars) lines.push(`\u603B\u661F\u6570\uFF1A${totalStars}`);
+  if (maxScore) lines.push(`\u603B\u5206\uFF1A${maxScore}`);
   const details = Array.isArray(data.all_floor_detail) ? data.all_floor_detail.filter(isRecord) : [];
   if (details.length) {
-    lines.push(`\u5173\u5361\u6570\u91CF\uFF1A${details.length}`);
-    for (const floor of details.slice(0, 12)) {
-      const name2 = text(floor.name) || text(floor.floor_name) || text(floor.index) || "\u5173\u5361";
+    const maxFloor = text(data.max_floor);
+    const progress = maxFloor ? details.find((item) => {
+      const name2 = text(item.name) || text(item.floor) || "";
+      return name2 === maxFloor || name2.startsWith(maxFloor) || maxFloor.startsWith(name2);
+    }) : void 0;
+    const selected = progress ? [progress] : details.slice(0, 12);
+    for (const floor of selected) {
+      const name2 = text(floor.name) || text(floor.floor_name) || text(floor.floor) || text(floor.index) || "\u5173\u5361";
       const nodes = ["node_1", "node_2", "node_3"].map((key) => floor[key]).filter(isRecord);
       const scores = nodes.map((node) => Number(node.score)).filter(Number.isFinite);
       const score = text(floor.score) || (scores.length ? String(scores.reduce((sum, item) => sum + item, 0)) : void 0);
-      lines.push(`${name2}${score ? `\uFF1A${score}` : ""}`);
+      const stars2 = text(floor.star_num) || text(floor.star) || text(floor.total_star);
+      lines.push(`${maxFloor ? "\u6700\u9AD8\u901A\u5173" : "\u5173\u5361"}\uFF1A${name2}${stars2 ? `\uFF08${stars2} \u661F\uFF09` : ""}${score ? `\uFF0C\u5F97\u5206 ${score}` : ""}`);
     }
+  } else if (text(data.max_floor)) {
+    lines.push(`\u6700\u9AD8\u901A\u5173\uFF1A${text(data.max_floor)}`);
   }
-  const peaks = Array.isArray(data.challenge_peak_records) ? data.challenge_peak_records.filter(isRecord) : [];
-  const peak = peaks[schedule === 1 ? 0 : schedule === 2 ? 1 : 2];
-  if (peak) {
-    const value = text(peak.score) || text(peak.total_score);
-    lines.push(`\u5F02\u76F8\u8BB0\u5F55${value ? `\uFF1A${value}` : ""}`);
-    const mobs = Array.isArray(peak.mob_records) ? peak.mob_records : [];
-    lines.push(`\u9A91\u58EB\u8BB0\u5F55\uFF1A${mobs.length}`);
-  }
-  return lines.length ? `${label}
-${lines.slice(0, 22).join("\n")}` : formatRecord(label, data);
+  return `${label}${lines.length ? `
+${lines.slice(0, 22).join("\n")}` : ""}`;
 }
 __name(formatChallenge, "formatChallenge");
+function recordError(result) {
+  if (result.retcode === 10102) return "\u67E5\u8BE2\u5931\u8D25\uFF1A\u8BE5\u89D2\u8272\u7684\u7C73\u6E38\u793E\u6570\u636E\u672A\u516C\u5F00\u3002";
+  if (result.retcode === 10101) return "\u67E5\u8BE2\u5931\u8D25\uFF1A\u4ECA\u65E5\u67E5\u8BE2\u6B21\u6570\u5DF2\u8FBE\u4E0A\u9650\u3002";
+  if (result.retcode === 1008) return "\u67E5\u8BE2\u5931\u8D25\uFF1A\u8BF7\u5148\u5728\u7C73\u6E38\u793E\u7ED1\u5B9A\u89D2\u8272\u3002";
+  if ([1034, 10035].includes(result.retcode)) return "\u67E5\u8BE2\u5931\u8D25\uFF1A\u5E73\u53F0\u8981\u6C42\u9A8C\u8BC1\u7801\uFF0C\u8BF7\u5728\u5B98\u65B9\u5BA2\u6237\u7AEF\u5B8C\u6210\u9A8C\u8BC1\u3002";
+  if ([5003, 10041].includes(result.retcode)) return "\u67E5\u8BE2\u5931\u8D25\uFF1A\u8D26\u53F7\u6216\u8BBE\u5907\u72B6\u6001\u5F02\u5E38\uFF0C\u8BF7\u5728\u5B98\u65B9\u5BA2\u6237\u7AEF\u68C0\u67E5\u3002";
+  if (result.retcode === -10001 || result.retcode === 10001) {
+    const message = typeof result.message === "string" ? result.message : "";
+    if (/device|fingerprint|risk|forbidden|风控|设备/i.test(message)) return "\u67E5\u8BE2\u5931\u8D25\uFF1A\u8BF7\u6C42\u88AB\u8BBE\u5907\u6216\u98CE\u63A7\u7B56\u7565\u62D2\u7EDD\uFF0C\u8BF7\u5148\u5728\u5B98\u65B9\u5BA2\u6237\u7AEF\u6253\u5F00\u5BF9\u5E94\u89D2\u8272\u9875\u9762\u540E\u91CD\u8BD5\u3002";
+    if (/登录|log[ -]?in|not logged in|(?:token|cookie).*(?:expired|invalid)|(?:expired|invalid).*(?:token|cookie)/i.test(message)) return "\u67E5\u8BE2\u5931\u8D25\uFF1ACookie \u6216\u767B\u5F55\u72B6\u6001\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u7ED1\u5B9A\u7C73\u6E38\u793E\u51ED\u8BC1\u3002";
+    return `\u67E5\u8BE2\u5931\u8D25\uFF08${result.retcode}\uFF09\uFF1A\u8BB0\u5F55\u63A5\u53E3\u62D2\u7EDD\u8BF7\u6C42\uFF0C\u539F\u56E0\u672A\u77E5\uFF0C\u8BF7\u5728\u5B98\u65B9\u5BA2\u6237\u7AEF\u68C0\u67E5\u8D26\u53F7\u72B6\u6001\u3002`;
+  }
+  return `\u67E5\u8BE2\u5931\u8D25\uFF08${result.retcode}\uFF09\uFF0C\u8BF7\u68C0\u67E5\u89D2\u8272\u5C55\u793A\u6743\u9650\u53CA\u5B98\u65B9\u5BA2\u6237\u7AEF\u72B6\u6001\u3002`;
+}
+__name(recordError, "recordError");
+function formatAccountOverview(data) {
+  const lines = [
+    `${data.game === "gs" ? "\u539F\u795E" : "\u661F\u7A79\u94C1\u9053"}\u8D26\u53F7\u6982\u89C8`,
+    `UID\uFF1A${data.uid}`,
+    `\u6635\u79F0\uFF1A${data.nickname}`
+  ];
+  lines.push(...data.characters.map((character) => character.name));
+  return lines.join("\n");
+}
+__name(formatAccountOverview, "formatAccountOverview");
 function createRecords(client, cache) {
   const cn = /* @__PURE__ */ __name((region) => region.startsWith("cn_") || region.endsWith("_cn"), "cn");
   const host = /* @__PURE__ */ __name((region) => cn(region) ? "https://api-takumi-record.mihoyo.com" : "https://sg-act-public-api.hoyolab.com", "host");
+  async function queryAccount(account, secret, device, includeChallenges = false) {
+    if (account.game !== "gs" && account.game !== "sr") return "\u8BE5\u6E38\u620F\u4E0D\u652F\u6301\u8D26\u53F7\u6982\u89C8\u3002";
+    const owned = await client.discover(secret);
+    if (!owned.some((role2) => role2.game === account.game && role2.uid === account.uid && role2.region === account.region)) {
+      return "\u67E5\u8BE2\u5931\u8D25\uFF1A\u5F53\u524D\u51ED\u8BC1\u672A\u7ED1\u5B9A\u8BE5\u6E38\u620F UID\uFF0C\u62D2\u7EDD\u8BF7\u6C42\u3002";
+    }
+    const game = account.game;
+    const prefix = game === "gs" ? "/game_record/app/genshin/api/" : "/game_record/app/hkrpg/api/";
+    const params = new URLSearchParams({ role_id: account.uid, server: account.region });
+    async function section(path, extra, body) {
+      try {
+        const query2 = new URLSearchParams(params);
+        for (const [key, value] of Object.entries(extra || {})) query2.set(key, value);
+        const result = await client.record(`${host(account.region)}${prefix}${path}${body ? "" : `?${query2}`}`, secret, body, device);
+        return result.retcode === 0 ? { data: result.data } : { error: recordError(result) };
+      } catch {
+        return { error: "\u67E5\u8BE2\u5931\u8D25\uFF1A\u63A5\u53E3\u8BF7\u6C42\u5F02\u5E38\u3002" };
+      }
+    }
+    __name(section, "section");
+    const index = await section("index");
+    const data = isRecord(index.data) ? index.data : {};
+    const role = isRecord(data.role) ? data.role : {};
+    const profile = game === "sr" ? await section("role/basicInfo") : void 0;
+    const profileData = isRecord(profile?.data) ? profile.data : {};
+    const profileRole = isRecord(profileData.role) ? profileData.role : {};
+    const roleSection = game === "gs" ? await section("character/list", void 0, { role_id: account.uid, server: account.region }) : await section("avatar/basic");
+    const characters2 = roleList(roleSection.data);
+    const overview = {
+      game,
+      uid: account.uid,
+      nickname: text(role.nickname) || text(data.nickname) || text(profileRole.nickname) || text(profileData.nickname) || "\u672A\u77E5",
+      avatar: accountAvatar(role) || accountAvatar(data) || accountAvatar(profileRole) || accountAvatar(profileData),
+      level: text(role.level) || text(data.level) || text(profileRole.level) || text(profileData.level),
+      server: text(profileData.region_name) || text(profileRole.region_name) || account.region,
+      characters: characters2.map((character) => {
+        const id = valueOf(character, ["id", "avatar_id", "character_id"]) || "\u672A\u77E5ID";
+        return {
+          id,
+          name: valueOf(character, ["name", "avatar_name", "character_name"]) || "\u672A\u77E5\u6635\u79F0",
+          avatar: accountCharacterAvatar(game, character, id)
+        };
+      })
+    };
+    if (game === "sr" && includeChallenges) {
+      const challengeTypes = ["forgotten", "fiction", "apocalypse", "anomaly"];
+      const challengeResults = await Promise.all(challengeTypes.map(async (type) => {
+        const query2 = new URLSearchParams({ role_id: account.uid, schedule_type: "1", server: account.region });
+        try {
+          const result = await client.record(`${host(account.region)}${prefix}${recordTypes.sr[type]}?${query2}`, secret, void 0, device);
+          return result.retcode === 0 && isRecord(result.data) ? [type, result.data] : void 0;
+        } catch {
+          return void 0;
+        }
+      }));
+      overview.challenges = Object.fromEntries(challengeResults.filter((item) => item !== void 0));
+    }
+    return overview;
+  }
+  __name(queryAccount, "queryAccount");
+  async function queryStamina(account, secret, device) {
+    if (account.game !== "sr") return void 0;
+    const prefix = "/game_record/app/hkrpg/api/";
+    const params = new URLSearchParams({ role_id: account.uid, server: account.region });
+    try {
+      const result = await client.record(`${host(account.region)}${prefix}note?${params}`, secret, void 0, device);
+      if (result.retcode !== 0) return void 0;
+      return isRecord(result.data) ? result.data : void 0;
+    } catch {
+      return void 0;
+    }
+  }
+  __name(queryStamina, "queryStamina");
   async function warmStarRailData(data) {
     if (!cache || !isRecord(data)) return;
     const avatars = roleList(data);
@@ -4197,7 +4363,7 @@ function createRecords(client, cache) {
     if (game === "gs") {
       body = { role_id: account.uid, server: account.region };
       const list = await client.record(`${host(account.region)}${prefix}${recordTypes.gs.roles}`, secret, body, device);
-      if (list.retcode !== 0) return `\u89D2\u8272\u5217\u8868\u67E5\u8BE2\u5931\u8D25\uFF08${list.retcode}\uFF09\u3002`;
+      if (list.retcode !== 0) return recordError(list);
       const ids = roleList(list.data).map((role) => role.id).filter((id) => typeof id === "number" || typeof id === "string").slice(0, 60);
       if (!ids.length) return "\u6CA1\u6709\u53EF\u66F4\u65B0\u7684\u89D2\u8272\u9762\u677F\u3002";
       body = { ...body, character_ids: ids };
@@ -4205,19 +4371,7 @@ function createRecords(client, cache) {
       url = `${hostUrl}?${params}`;
     }
     const result = await client.record(url, secret, body, device);
-    if (result.retcode !== 0) {
-      if (result.retcode === 10102) return "\u67E5\u8BE2\u5931\u8D25\uFF1A\u8BE5\u89D2\u8272\u7684\u7C73\u6E38\u793E\u6570\u636E\u672A\u516C\u5F00\u3002";
-      if (result.retcode === 10101) return "\u67E5\u8BE2\u5931\u8D25\uFF1A\u4ECA\u65E5\u67E5\u8BE2\u6B21\u6570\u5DF2\u8FBE\u4E0A\u9650\u3002";
-      if ([1034, 10035].includes(result.retcode)) return "\u67E5\u8BE2\u5931\u8D25\uFF1A\u5E73\u53F0\u8981\u6C42\u9A8C\u8BC1\u7801\uFF0C\u8BF7\u5728\u5B98\u65B9\u5BA2\u6237\u7AEF\u5B8C\u6210\u9A8C\u8BC1\u3002";
-      if ([5003, 10041].includes(result.retcode)) return "\u67E5\u8BE2\u5931\u8D25\uFF1A\u8D26\u53F7\u6216\u8BBE\u5907\u72B6\u6001\u5F02\u5E38\uFF0C\u8BF7\u5728\u5B98\u65B9\u5BA2\u6237\u7AEF\u68C0\u67E5\u3002";
-      if (result.retcode === -10001 || result.retcode === 10001) {
-        const message = result.message || "";
-        if (/登录|login|token|cookie/i.test(message)) return "\u67E5\u8BE2\u5931\u8D25\uFF1ACookie \u6216\u767B\u5F55\u72B6\u6001\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u7ED1\u5B9A\u7C73\u6E38\u793E\u51ED\u8BC1\u3002";
-        if (/device|fingerprint|risk|forbidden|风控|设备|异常/i.test(message)) return "\u67E5\u8BE2\u5931\u8D25\uFF1A\u8BF7\u6C42\u88AB\u8BBE\u5907\u6216\u98CE\u63A7\u7B56\u7565\u62D2\u7EDD\uFF0C\u8BF7\u5148\u5728\u5B98\u65B9\u5BA2\u6237\u7AEF\u6253\u5F00\u5BF9\u5E94\u89D2\u8272\u9875\u9762\u540E\u91CD\u8BD5\u3002";
-        return `\u67E5\u8BE2\u5931\u8D25\uFF08${result.retcode}\uFF09\uFF1A\u8BB0\u5F55\u63A5\u53E3\u62D2\u7EDD\u8BF7\u6C42\uFF0C\u8BF7\u68C0\u67E5\u8BBE\u5907\u6307\u7EB9\u3001\u89D2\u8272\u5C55\u793A\u6743\u9650\u53CA\u7C73\u6E38\u793E\u5BA2\u6237\u7AEF\u72B6\u6001\u3002`;
-      }
-      return `\u67E5\u8BE2\u5931\u8D25\uFF08${result.retcode}\uFF09\uFF0C\u8BF7\u68C0\u67E5\u89D2\u8272\u5C55\u793A\u6743\u9650\u53CA\u5B98\u65B9\u5BA2\u6237\u7AEF\u72B6\u6001\u3002`;
-    }
+    if (result.retcode !== 0) return recordError(result);
     if (game === "sr") {
       await warmStarRailData(result.data);
       if (cache && isRecord(result.data)) {
@@ -4251,10 +4405,17 @@ function createRecords(client, cache) {
     const params = new URLSearchParams({ role_id: account.uid, server: account.region });
     if (game === "sr" && type === "overview") {
       const index = await client.record(`${url}?${params}`, secret, void 0, device);
-      if (index.retcode !== 0) return `\u6982\u89C8\u67E5\u8BE2\u5931\u8D25\uFF08${index.retcode}\uFF09\u3002`;
-      const brief = await client.record(`${host(account.region)}${prefix}challenge_brief?${params}`, secret, void 0, device);
-      if (brief.retcode !== 0) return `\u6311\u6218\u6458\u8981\u67E5\u8BE2\u5931\u8D25\uFF08${brief.retcode}\uFF09\u3002`;
+      if (index.retcode !== 0) return recordError(index);
       const summary = formatRecord("sr overview", index.data);
+      let brief;
+      try {
+        brief = await client.record(`${host(account.region)}${prefix}challenge_brief?${params}`, secret, void 0, device);
+      } catch {
+        return `${summary}
+\u6311\u6218\u6458\u8981\uFF1A\u67E5\u8BE2\u5931\u8D25\uFF1A\u63A5\u53E3\u8BF7\u6C42\u5F02\u5E38\u3002`;
+      }
+      if (brief.retcode !== 0) return `${summary}
+\u6311\u6218\u6458\u8981\uFF1A${recordError(brief)}`;
       const schedules = Array.isArray(brief.data?.list) ? brief.data.list.filter(isRecord) : [];
       const lines = schedules.slice(0, 3).map((item) => {
         const current = isRecord(item.cur_schedule) ? item.cur_schedule : {};
@@ -4268,7 +4429,7 @@ ${lines.join("\n")}` : summary;
       body = { role_id: account.uid, server: account.region };
       if (type === "panel") {
         const list = await client.record(`${host(account.region)}${prefix}${paths.roles}`, secret, body, device);
-        if (list.retcode !== 0) return `\u89D2\u8272\u5217\u8868\u67E5\u8BE2\u5931\u8D25\uFF08${list.retcode}\uFF09\u3002`;
+        if (list.retcode !== 0) return recordError(list);
         const ids = roleList(list.data).map((role) => role.id).filter((id) => typeof id === "number" || typeof id === "string").slice(0, 60);
         if (!ids.length) return "\u6CA1\u6709\u53EF\u66F4\u65B0\u7684\u89D2\u8272\u9762\u677F\u3002";
         body = { ...body, character_ids: ids };
@@ -4281,43 +4442,26 @@ ${lines.join("\n")}` : summary;
         params.delete("server");
         for (const [key, value] of ordered) params.set(key, value);
       }
-      if (["forgotten", "fiction", "apocalypse", "anomaly", "abyss"].includes(type)) params.set("schedule_type", String(schedule));
-      if (game === "sr" && ["forgotten", "fiction", "apocalypse", "anomaly"].includes(type)) {
-        params.set("isPrev", "");
-        params.set("need_all", "true");
+      if (["forgotten", "fiction", "apocalypse", "anomaly", "abyss"].includes(type)) {
+        const ordered = new URLSearchParams({ role_id: account.uid, schedule_type: String(schedule), server: account.region });
+        params.delete("role_id");
+        params.delete("server");
+        for (const [key, value] of ordered) params.set(key, value);
       }
       if (game === "gs" && ["theater", "peril"].includes(type)) params.set("need_detail", "true");
     }
-    let result = await client.record(body ? url : `${url}?${params}`, secret, body, device);
-    if (result.retcode === 1034 && game === "sr" && ["forgotten", "fiction", "apocalypse", "anomaly"].includes(type)) {
-      params.delete("isPrev");
-      params.delete("need_all");
-      result = await client.record(`${url}?${params}`, secret, void 0, device);
-    }
-    if (result.retcode !== 0) {
-      if (result.retcode === 10102) return "\u67E5\u8BE2\u5931\u8D25\uFF1A\u8BE5\u89D2\u8272\u7684\u7C73\u6E38\u793E\u6570\u636E\u672A\u516C\u5F00\u3002";
-      if (result.retcode === 10101) return "\u67E5\u8BE2\u5931\u8D25\uFF1A\u4ECA\u65E5\u67E5\u8BE2\u6B21\u6570\u5DF2\u8FBE\u4E0A\u9650\u3002";
-      if (result.retcode === 1008) return "\u67E5\u8BE2\u5931\u8D25\uFF1A\u8BF7\u5148\u5728\u7C73\u6E38\u793E\u7ED1\u5B9A\u89D2\u8272\u3002";
-      if ([1034, 10035].includes(result.retcode)) return "\u67E5\u8BE2\u5931\u8D25\uFF1A\u5E73\u53F0\u8981\u6C42\u9A8C\u8BC1\u7801\uFF0C\u8BF7\u5728\u5B98\u65B9\u5BA2\u6237\u7AEF\u5B8C\u6210\u9A8C\u8BC1\u3002";
-      if ([5003, 10041].includes(result.retcode)) return "\u67E5\u8BE2\u5931\u8D25\uFF1A\u8D26\u53F7\u6216\u8BBE\u5907\u72B6\u6001\u5F02\u5E38\uFF0C\u8BF7\u5728\u5B98\u65B9\u5BA2\u6237\u7AEF\u68C0\u67E5\u3002";
-      if (result.retcode === -10001 || result.retcode === 10001) {
-        const message = result.message || "";
-        if (/登录|login|token|cookie/i.test(message)) return "\u67E5\u8BE2\u5931\u8D25\uFF1ACookie \u6216\u767B\u5F55\u72B6\u6001\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u7ED1\u5B9A\u7C73\u6E38\u793E\u51ED\u8BC1\u3002";
-        if (/device|fingerprint|risk|forbidden|风控|设备|异常/i.test(message)) return "\u67E5\u8BE2\u5931\u8D25\uFF1A\u8BF7\u6C42\u88AB\u8BBE\u5907\u6216\u98CE\u63A7\u7B56\u7565\u62D2\u7EDD\uFF0C\u8BF7\u5148\u5728\u5B98\u65B9\u5BA2\u6237\u7AEF\u6253\u5F00\u5BF9\u5E94\u89D2\u8272\u9875\u9762\u540E\u91CD\u8BD5\u3002";
-        return `\u67E5\u8BE2\u5931\u8D25\uFF08${result.retcode}\uFF09\uFF1A\u8BB0\u5F55\u63A5\u53E3\u62D2\u7EDD\u8BF7\u6C42\uFF0C\u8BF7\u68C0\u67E5\u8BBE\u5907\u6307\u7EB9\u3001\u89D2\u8272\u5C55\u793A\u6743\u9650\u53CA\u7C73\u6E38\u793E\u5BA2\u6237\u7AEF\u72B6\u6001\u3002`;
-      }
-      return `\u67E5\u8BE2\u5931\u8D25\uFF08${result.retcode}\uFF09\uFF0C\u8BF7\u68C0\u67E5\u89D2\u8272\u5C55\u793A\u6743\u9650\u53CA\u5B98\u65B9\u5BA2\u6237\u7AEF\u72B6\u6001\u3002`;
-    }
+    const result = await client.record(body ? url : `${url}?${params}`, secret, body, device);
+    if (result.retcode !== 0) return recordError(result);
     if (type === "panel" && character) {
       const selected = findRole(result.data, character);
       if (!selected) return `\u672A\u627E\u5230\u89D2\u8272\u201C${character}\u201D\uFF0C\u8BF7\u5148\u4F7F\u7528 mys.record ${game} panel \u67E5\u770B\u89D2\u8272\u540D\u79F0\u3002`;
       return panelRecord(selected, `${game} ${character} \u9762\u677F`);
     }
     const label = `${game} ${type}\uFF08${schedule === 2 ? "\u4E0A\u671F" : schedule === 3 ? "\u5F80\u671F" : "\u672C\u671F"}\uFF09`;
-    return game === "sr" && ["forgotten", "fiction", "apocalypse", "anomaly"].includes(type) ? formatChallenge(label, result.data, schedule) : formatRecord(label, result.data);
+    return game === "sr" && ["forgotten", "fiction", "apocalypse", "anomaly"].includes(type) ? formatChallenge(label, result.data, schedule, type) : formatRecord(label, result.data);
   }
   __name(query, "query");
-  return { query, queryPanel };
+  return { query, queryPanel, queryAccount, queryStamina };
 }
 __name(createRecords, "createRecords");
 
@@ -4446,6 +4590,87 @@ function createVault(ctx, keyText) {
 __name(createVault, "createVault");
 
 // src/panel.ts
+var import_koishi = require("koishi");
+function recordValue(data, keys) {
+  for (const key of keys) {
+    const value = data?.[key];
+    if (value !== void 0 && value !== null && value !== "") return String(value);
+  }
+  return void 0;
+}
+__name(recordValue, "recordValue");
+function challengeText(data, keys) {
+  return recordValue(data, keys);
+}
+__name(challengeText, "challengeText");
+function stars(value, total = 3, extra = false) {
+  if (!value) return "";
+  const count = Math.max(0, Math.min(total, Number(value) || 0));
+  return `<span class="stars" aria-label="${escape(value)}\u661F">${"\u2605".repeat(count)}${"\u2606".repeat(total - count)}${extra ? '<i class="extra-star" title="\u661F\u542F\u6A21\u5F0F">\u2726</i>' : ""}</span>`;
+}
+__name(stars, "stars");
+function challengeFloor(data) {
+  const details = Array.isArray(data.all_floor_detail) ? data.all_floor_detail.filter((item) => item && typeof item === "object") : [];
+  const maxFloor = challengeText(data, ["max_floor"]);
+  const selected = maxFloor ? details.find((item) => {
+    const name3 = challengeText(item, ["name", "floor"]) || "";
+    return name3 === maxFloor || name3.startsWith(maxFloor) || maxFloor.startsWith(name3);
+  }) : details.at(-1);
+  const floor = selected || (maxFloor ? { name: maxFloor } : void 0);
+  if (!floor) return void 0;
+  const name2 = challengeText(floor, ["name", "floor"]) || maxFloor;
+  const nodes = ["node_1", "node_2", "node_3"].map((key) => floor[key]).filter((item) => item && typeof item === "object");
+  const nodeScores = nodes.map((node) => Number(challengeText(node, ["score"]))).filter(Number.isFinite);
+  const score = challengeText(floor, ["score"]) || (nodeScores.length ? String(nodeScores.reduce((sum, item) => sum + item, 0)) : void 0);
+  const star = challengeText(floor, ["star_num", "star", "total_star"]) || challengeText(data, ["star_num", "total_star"]);
+  const extraStar = challengeText(floor, ["extra_star_num"]) || challengeText(data, ["extra_star_num"]);
+  return name2 ? { name: name2, score, star, extraStar } : void 0;
+}
+__name(challengeFloor, "challengeFloor");
+function challengeRows(data) {
+  if (!data) return "";
+  const items = [
+    ["forgotten", "\u5FD8\u5374\u4E4B\u5EAD"],
+    ["fiction", "\u865A\u6784\u53D9\u4E8B"],
+    ["apocalypse", "\u672B\u65E5\u5E7B\u5F71"]
+  ].map(([key, label]) => {
+    const floor = challengeFloor(data[key] || {});
+    if (!floor) return "";
+    const baseStars = stars(floor.star);
+    const extraStar = Number(floor.extraStar) > 0;
+    const starDisplay = `<span class="stars" aria-label="${escape(floor.star || "0")}\u661F${extraStar ? "\uFF0C\u542B\u661F\u542F\u661F" : ""}">${baseStars.replace(/^<span[^>]*>|<\/span>$/g, "")}${extraStar ? '<i class="extra-star" title="\u661F\u542F\u6A21\u5F0F">\u2726</i>' : ""}</span>`;
+    return `<div class="challenge-row"><strong>${label}</strong><span class="challenge-floor">${escape(floor.name)}</span><span class="challenge-result">${starDisplay}${floor.score ? `<small>\u5F97\u5206 ${escape(floor.score)}</small>` : ""}</span></div>`;
+  }).filter(Boolean).join("");
+  return items ? `<section class="challenge-list"><h2>\u6311\u6218\u8BB0\u5F55</h2>${items}</section>` : "";
+}
+__name(challengeRows, "challengeRows");
+function anomalyCard(data) {
+  if (!data) return "";
+  const peaks = Array.isArray(data.challenge_peak_records) ? data.challenge_peak_records : [];
+  const peak = peaks[0] && typeof peaks[0] === "object" ? peaks[0] : void 0;
+  if (!peak) return "";
+  const group = peak.group && typeof peak.group === "object" ? peak.group : void 0;
+  const bossInfo = peak.boss_info && typeof peak.boss_info === "object" ? peak.boss_info : void 0;
+  const bossRecord = peak.boss_record && typeof peak.boss_record === "object" ? peak.boss_record : void 0;
+  const bossName = challengeText(bossInfo, ["name_mi18n", "name"]);
+  const bossStars = challengeText(peak, ["boss_stars"]) || challengeText(bossRecord, ["star_num"]);
+  const mobStars = challengeText(peak, ["mob_stars"]);
+  const battle = challengeText(data.challenge_peak_best_record_brief, ["total_battle_num"]);
+  if (!bossName && !bossStars && !mobStars && !battle) return "";
+  return `<section class="anomaly-card"><div class="anomaly-row"><strong>\u5F02\u76F8\u4EF2\u88C1</strong><span class="anomaly-season">${escape(challengeText(group, ["name_mi18n", "name"]) || "\u672C\u671F")}</span><span class="anomaly-extra">${battle ? `\u6311\u6218 ${escape(battle)} \u6B21` : ""}</span></div><div class="anomaly-grid"><div><label>\u738B\u68CB</label><strong>${escape(bossName || "\u5DF2\u8BB0\u5F55")}</strong><span>${stars(bossStars, 3)}</span></div><div><label>\u9A91\u58EB</label><strong>\u4E09\u5173\u5408\u8BA1</strong><span class="mob-total">${escape(mobStars || "7")} \u661F</span></div></div></section>`;
+}
+__name(anomalyCard, "anomalyCard");
+function serverName(region) {
+  const names = {
+    prod_gf_cn: "\u661F\u7A79\u5217\u8F66",
+    prod_official_usa: "America",
+    prod_official_eur: "Europe",
+    prod_official_asia: "Asia",
+    prod_official_cht: "TW/HK/MO"
+  };
+  return region ? names[region] || region : "\u672A\u77E5\u670D\u52A1\u5668";
+}
+__name(serverName, "serverName");
 function escape(value) {
   return value.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
 }
@@ -4554,6 +4779,26 @@ function renderHtml(ctx, html) {
   });
 }
 __name(renderHtml, "renderHtml");
+function renderAccountHtml(ctx, html, selector) {
+  if (!ctx.puppeteer) throw new Error("\u9700\u8981\u542F\u7528 Koishi puppeteer \u670D\u52A1\u3002");
+  return ctx.puppeteer.render(html, async (page, next) => {
+    try {
+      await page.evaluate(async () => {
+        await Promise.all(Array.from(document.images).map((image2) => image2.decode().catch(() => {
+        })));
+      });
+      const target = await page.$(selector);
+      if (!target) throw new Error("\u8D26\u53F7\u6982\u89C8\u6E32\u67D3\u5931\u8D25\uFF1A\u672A\u627E\u5230\u5185\u5BB9\u533A\u57DF\u3002");
+      const buffer = await target.screenshot({ type: "jpeg", quality: 65 });
+      return import_koishi.h.image(buffer, "image/jpeg").toString();
+    } catch (error) {
+      await page.close().catch(() => {
+      });
+      throw error;
+    }
+  });
+}
+__name(renderAccountHtml, "renderAccountHtml");
 function createPanel(ctx) {
   ctx.model.extend("miyoushe_panel", {
     id: "string",
@@ -4567,6 +4812,47 @@ function createPanel(ctx) {
     updatedAt: "string"
   }, { primary: "id" });
   return {
+    async renderAccount(data, userAvatar) {
+      const characters2 = data.characters.length ? data.characters.map((character) => `<article class="character-card">${image(character.avatar, "character-avatar")}<strong>${escape(character.name)}</strong></article>`).join("") : '<div class="empty">\u6682\u65E0\u89D2\u8272\u5C55\u793A\u6570\u636E</div>';
+      const avatar = image(data.avatar || (userAvatar ? userAvatar.replace(/^http:\/\//i, "https://") : void 0), "account-avatar");
+      const title = data.nickname === "\u672A\u77E5" ? `${data.game === "gs" ? "\u539F\u795E" : "\u661F\u7A79\u94C1\u9053"}\u8D26\u53F7` : data.nickname;
+      const html = `<html><head><meta charset="utf-8"><style>*{box-sizing:border-box}body{margin:0;padding:14px;width:640px;background:#111827;color:#f5f7fb;font-family:Arial,'Microsoft YaHei',sans-serif}.sheet{padding:14px;border:1px solid #46536b;border-radius:12px;background:#1b2537}.account-head{display:flex;align-items:center;gap:12px;padding-bottom:12px;border-bottom:1px solid #46536b}.account-avatar{width:56px;height:56px;border-radius:50%;object-fit:cover;background:#263149;border:2px solid #7384a7}.account-info{min-width:0}.account-info h1{margin:0 0 4px;font-size:18px;overflow-wrap:anywhere}.account-info small{color:#aebbd2;font-size:10px}.character-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;margin-top:12px}.character-card{overflow:hidden;border:1px solid #3a4862;border-radius:7px;background:#263149;text-align:center}.character-avatar{display:block;width:100%;aspect-ratio:3/4;object-fit:cover;background:#1b2537}.character-card strong{display:block;padding:5px 3px;font-size:10px;line-height:1.25;overflow-wrap:anywhere}.placeholder{display:flex;align-items:center;justify-content:center;color:#9caac2;font-size:10px}.empty{grid-column:1/-1;padding:20px;text-align:center;color:#aebbd2}</style></head><body><main class="sheet"><header class="account-head">${avatar}<div class="account-info"><h1>${escape(title)}</h1><small>UID ${escape(data.uid)}</small></div></header><section class="character-grid">${characters2}</section></main></body></html>`;
+      return renderAccountHtml(ctx, html, ".sheet");
+    },
+    async renderRecordOverview(data, userAvatar) {
+      const avatar = image(data.avatar || (userAvatar ? userAvatar.replace(/^http:\/\//i, "https://") : void 0), "account-avatar");
+      const title = data.nickname === "\u672A\u77E5" ? "\u5F00\u62D3\u8005" : data.nickname;
+      const noteData = data.stamina;
+      const energy = noteData?.energy && typeof noteData.energy === "object" ? noteData.energy : void 0;
+      const current = recordValue(noteData, ["current_stamina"]) || recordValue(energy, ["current"]) || "\u6682\u65E0\u6570\u636E";
+      const max = recordValue(noteData, ["max_stamina"]) || recordValue(energy, ["max"]);
+      const reserve = recordValue(noteData, ["reserve_stamina"]) || recordValue(noteData, ["backup_stamina"]) || "0";
+      const trainValue = noteData?.weekly_train_score || noteData?.current_train_score;
+      const train = trainValue && typeof trainValue === "object" ? trainValue : void 0;
+      const dailyCurrent = recordValue(train, ["current"]) || recordValue(noteData, ["daily_train_score"]);
+      const dailyMax = recordValue(train, ["max"]) || recordValue(noteData, ["daily_train_score_max"]);
+      const weeklyCurrent = recordValue(noteData, ["weekly_cocoon_cnt", "weekly_echo_count"]);
+      const weeklyLimit = recordValue(noteData, ["weekly_cocoon_cnt_max", "weekly_echo_limit"]) || "3";
+      const weeklyMax = weeklyCurrent !== void 0 ? weeklyLimit : void 0;
+      const cycleCurrent = recordValue(noteData, ["rogue_score", "weekly_rogue_score", "cycle_score"]);
+      const cycleMax = recordValue(noteData, ["rogue_score_max", "weekly_rogue_score_max", "cycle_score_max"]);
+      const value = /* @__PURE__ */ __name((current2, maximum) => current2 ? `${current2}${maximum ? `/${maximum}` : ""}` : "\u6682\u65E0\u6570\u636E", "value");
+      const daily = dailyCurrent ? `${dailyCurrent}${dailyMax ? `/${dailyMax}` : ""}` : "\u6682\u65E0\u6570\u636E";
+      const weekly = weeklyCurrent ? `${weeklyCurrent}${weeklyMax ? `/${weeklyMax}` : ""}` : "\u6682\u65E0\u6570\u636E";
+      const cycle = cycleCurrent ? `${cycleCurrent}${cycleMax ? `/${cycleMax}` : ""}` : "\u6682\u65E0\u6570\u636E";
+      const rows = [
+        dailyCurrent ? `<div class="metric"><span>\u6BCF\u65E5\u5B9E\u8BAD</span><b>${escape(daily)}</b></div>` : "",
+        weeklyCurrent ? `<div class="metric"><span>\u5386\u6218\u4F59\u54CD</span><b>${escape(weekly)}</b></div>` : "",
+        cycleCurrent ? `<div class="metric"><span>\u5468\u671F\u79EF\u5206</span><b>${escape(cycle)}</b></div>` : ""
+      ].filter(Boolean).join("");
+      const stamina = current !== "\u6682\u65E0\u6570\u636E" ? `<div class="stamina"><strong>${escape(value(current, max))}</strong><small>\u5F00\u62D3\u529B${reserve !== "0" ? ` \xB7 \u5907\u7528 ${escape(reserve)}` : ""}</small></div>` : "";
+      const metricContent = stamina && rows ? `${stamina}<div class="metrics">${rows}</div>` : stamina || rows;
+      const note = metricContent ? `<section class="note ${stamina && rows ? "" : "single"}">${metricContent}</section>` : "";
+      const challenges = challengeRows(data.challenges);
+      const anomaly = anomalyCard(data.challenges?.anomaly);
+      const html = `<html><head><meta charset="utf-8"><style>*{box-sizing:border-box}body{margin:0;padding:0;width:800px;background:#121826;color:#f5f7fb;font-family:Arial,'Microsoft YaHei',sans-serif}.overview{display:table;overflow:hidden;border:1px solid #39465d;border-radius:10px;background:#1b2537}.hero{min-height:150px;display:flex;align-items:center;gap:22px;padding:18px 26px;background:linear-gradient(100deg,#74604b,#323d50 68%,#202b40)}.account-avatar{width:104px;height:104px;border:3px solid #e7d49e;border-radius:50%;object-fit:cover;background:#263149}.identity{min-width:0}.nickname{font-size:34px;font-weight:600;overflow-wrap:anywhere}.nickname small{font-size:18px}.details{margin-top:8px;font-size:20px;color:#e3e8f2}.details span{margin-right:16px}.note{display:grid;grid-template-columns:minmax(180px,1fr) minmax(300px,1fr);gap:0;padding:20px 24px;background:#f1f0ed;color:#282a30}.note.single{grid-template-columns:1fr}.stamina{display:flex;flex-direction:column;justify-content:center;padding:4px 24px;border-right:1px dotted #aeb1b8}.note.single .stamina{border-right:0}.stamina strong{font-size:30px;color:#bd8732}.stamina small{margin-top:8px;color:#727780;font-size:15px}.metric{display:flex;justify-content:space-between;align-items:center;padding:13px 22px;border-bottom:1px solid #d8d8d6;font-size:19px}.metric b{font-size:22px}.metric:last-child{border-bottom:0}.challenge-list{padding:18px 24px 8px;background:#f1f0ed;color:#282a30;border-top:1px solid #d8d8d6}.challenge-list h2{margin:0 0 8px;font-size:21px}.challenge-row{display:grid;grid-template-columns:120px 1fr auto;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid #d8d8d6}.challenge-row:last-child{border-bottom:0}.challenge-row strong{font-size:18px}.challenge-floor{font-size:17px;overflow-wrap:anywhere}.challenge-result{display:flex;flex-direction:column;align-items:flex-end;gap:3px}.stars{color:#d39a2d;font-size:23px;letter-spacing:2px;white-space:nowrap}.stars small{color:#737780;font-size:13px;letter-spacing:0}.extra-star{color:#9a7cff;font-style:normal;font-size:25px;margin-left:4px}.anomaly-card{margin:0;padding:18px 24px 20px;background:#f1f0ed;color:#282a30;border-top:1px solid #d8d8d6}.anomaly-row{display:grid;grid-template-columns:120px 1fr auto;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid #d8d8d6}.anomaly-row strong{font-size:18px}.anomaly-season{font-size:17px}.anomaly-extra{font-size:14px;color:#737780}.anomaly-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}.anomaly-grid>div{display:grid;grid-template-columns:auto 1fr;align-items:center;gap:4px 10px;padding:12px 14px;background:#e7e5e2;border:1px solid #d0ceca;border-radius:8px}.anomaly-grid label{grid-column:1/-1;color:#737780;font-size:14px}.anomaly-grid strong{font-size:17px;overflow-wrap:anywhere}.anomaly-grid .stars{grid-column:1/-1}.mob-total{grid-column:1/-1;color:#bd8732;font-size:20px;font-weight:600}</style></head><body><main class="overview"><header class="hero">${avatar}<div class="identity"><div class="nickname">${escape(title)}${data.level ? ` <small>Lv.${escape(data.level)}</small>` : ""}</div><div class="details"><span>${escape(serverName(data.server))}</span> UID ${escape(data.uid)}</div></div></header>${note}${challenges}${anomaly}</main></body></html>`;
+      return renderAccountHtml(ctx, html, ".overview");
+    },
     async save(role, title, summary, data) {
       const lines = summary.split("\n").slice(0, 30).map((line) => line.slice(0, 120));
       const row = { id: role.id, platform: role.platform, userId: role.userId, game: role.game, uid: role.uid, title: title.slice(0, 80), lines: JSON.stringify(lines), data: data ? JSON.stringify(data) : void 0, updatedAt: (/* @__PURE__ */ new Date()).toISOString() };
@@ -4670,19 +4956,19 @@ __name(createStaticCache, "createStaticCache");
 // src/index.ts
 var name = "miyoushe-sign";
 var inject = ["database", "http", "puppeteer"];
-var ConfigAccount = import_koishi.Schema.object({
-  platform: import_koishi.Schema.string().default("onebot"),
-  userId: import_koishi.Schema.string().description("\u63A5\u6536\u7B7E\u5230\u7ED3\u679C\u7684\u7528\u6237 ID\u3002"),
-  ltuid: import_koishi.Schema.string().description("\u7C73\u54C8\u6E38\u901A\u884C\u8BC1 ID\u3002"),
-  cookie: import_koishi.Schema.string().role("secret").description("\u6E38\u620F CK\uFF0C\u5EFA\u8BAE\u586B\u5199\u5B8C\u6574 Cookie\u3002"),
-  stoken: import_koishi.Schema.string().role("secret").description("\u793E\u533A SToken Cookie\uFF0C\u9700\u5305\u542B stuid/stoken/ltoken\u3002")
+var ConfigAccount = import_koishi2.Schema.object({
+  platform: import_koishi2.Schema.string().default("onebot"),
+  userId: import_koishi2.Schema.string().description("\u63A5\u6536\u7B7E\u5230\u7ED3\u679C\u7684\u7528\u6237 ID\u3002"),
+  ltuid: import_koishi2.Schema.string().description("\u7C73\u54C8\u6E38\u901A\u884C\u8BC1 ID\u3002"),
+  cookie: import_koishi2.Schema.string().role("secret").description("\u6E38\u620F CK\uFF0C\u5EFA\u8BAE\u586B\u5199\u5B8C\u6574 Cookie\u3002"),
+  stoken: import_koishi2.Schema.string().role("secret").description("\u793E\u533A SToken Cookie\uFF0C\u9700\u5305\u542B stuid/stoken/ltoken\u3002")
 });
-var Config = import_koishi.Schema.object({
-  encryptionKey: import_koishi.Schema.string().role("secret").description("\u51ED\u8BC1\u52A0\u5BC6\u5BC6\u94A5\uFF0C\u9700\u4E3A 32 \u5B57\u8282\u968F\u673A\u5BC6\u94A5\u7684 Base64\uFF1B\u7559\u7A7A\u5219\u4EC5\u672C\u6B21\u8FD0\u884C\u968F\u673A\u751F\u6210\u3002").default(process.env.MIYOUSHE_SIGN_KEY || ""),
-  accounts: import_koishi.Schema.array(ConfigAccount).default([]).description("\u542F\u52A8\u65F6\u5BFC\u5165\u7684\u7C73\u6E38\u793E\u8D26\u53F7\u51ED\u8BC1\u3002"),
-  timeout: import_koishi.Schema.natural().role("ms").default(12e3),
-  interval: import_koishi.Schema.natural().role("ms").min(2e3).default(3e3),
-  hour: import_koishi.Schema.number().min(0).max(23).step(1).default(9)
+var Config = import_koishi2.Schema.object({
+  encryptionKey: import_koishi2.Schema.string().role("secret").description("\u51ED\u8BC1\u52A0\u5BC6\u5BC6\u94A5\uFF0C\u9700\u4E3A 32 \u5B57\u8282\u968F\u673A\u5BC6\u94A5\u7684 Base64\uFF1B\u7559\u7A7A\u5219\u4EC5\u672C\u6B21\u8FD0\u884C\u968F\u673A\u751F\u6210\u3002").default(process.env.MIYOUSHE_SIGN_KEY || ""),
+  accounts: import_koishi2.Schema.array(ConfigAccount).default([]).description("\u542F\u52A8\u65F6\u5BFC\u5165\u7684\u7C73\u6E38\u793E\u8D26\u53F7\u51ED\u8BC1\u3002"),
+  timeout: import_koishi2.Schema.natural().role("ms").default(12e3),
+  interval: import_koishi2.Schema.natural().role("ms").min(2e3).default(3e3),
+  hour: import_koishi2.Schema.number().min(0).max(23).step(1).default(9)
 });
 var forumNames = Object.keys(forums);
 var gameNames = Object.keys(games);
@@ -4697,8 +4983,8 @@ async function renderQr(ctx, url) {
   });
 }
 __name(renderQr, "renderQr");
-function identity(session) {
-  return session.isDirect && session.platform && session.userId ? [session.platform, session.userId] : void 0;
+function identity(session, allowGroup = false) {
+  return (allowGroup || session.isDirect) && session.platform && session.userId ? [session.platform, session.userId] : void 0;
 }
 __name(identity, "identity");
 function day() {
@@ -4723,6 +5009,33 @@ function apply(ctx, config) {
   const autoRunning = /* @__PURE__ */ new Set();
   const communityRunning = /* @__PURE__ */ new Set();
   const qrRunning = /* @__PURE__ */ new Set();
+  async function queryRoles(owner, game) {
+    let roles = (await accounts.roles(...owner)).filter((role) => role.game === game);
+    if (roles.length) return roles;
+    for (const row of await accounts.passports(...owner)) {
+      if (!row.cookie) continue;
+      await accounts.use(...owner, row.ltuid, "ck", async (cookie) => {
+        const discovered = await client.discover(cookie);
+        if (!discovered.length) return;
+        const previous = (await accounts.roles(...owner)).filter((role) => role.ltuid === row.ltuid && gameNames.includes(role.game)).map((role) => ({ game: role.game, uid: role.uid, region: role.region }));
+        const merged = [...discovered, ...previous.filter((role) => !discovered.some((item) => item.game === role.game && item.uid === role.uid && item.region === role.region))];
+        await accounts.save(...owner, row.ltuid, cookie, merged);
+      });
+    }
+    roles = (await accounts.roles(...owner)).filter((role) => role.game === game);
+    return roles;
+  }
+  __name(queryRoles, "queryRoles");
+  async function togglePassport(owner, first, second, kind) {
+    const state = ["on", "off"].includes(first) ? first : second;
+    const ltuid = ["on", "off"].includes(first) ? second : first;
+    if (!state || !["on", "off"].includes(state) || ltuid !== void 0 && !passportId.test(ltuid)) return { error: "\u7528\u6CD5\uFF1Aon|off [\u901A\u884C\u8BC1ID]\uFF0C\u4E5F\u517C\u5BB9 \u901A\u884C\u8BC1ID on|off\u3002" };
+    const rows = (await accounts.passports(...owner)).filter((row) => row[kind] && (!ltuid || row.ltuid === ltuid));
+    if (!rows.length) return { error: kind === "cookie" ? "\u672A\u627E\u5230\u5DF2\u7ED1\u5B9A\u6E38\u620F CK \u7684\u901A\u884C\u8BC1\uFF0C\u8BF7\u5148\u79C1\u804A\u626B\u7801\u767B\u5F55\u3002" : "\u672A\u627E\u5230\u5DF2\u7ED1\u5B9A SToken \u7684\u901A\u884C\u8BC1\uFF0C\u8BF7\u5148\u79C1\u804A\u626B\u7801\u767B\u5F55\u3002" };
+    if (rows.length > 1) return { error: `\u5B58\u5728\u591A\u4E2A\u901A\u884C\u8BC1\uFF0C\u8BF7\u6307\u5B9A\uFF1A${rows.map((row) => row.ltuid).join("\u3001")}\u3002` };
+    return { ltuid: rows[0].ltuid, state };
+  }
+  __name(togglePassport, "togglePassport");
   function panelSummary(data) {
     return data.characters.map((character) => [
       `\u89D2\u8272\uFF1A${character.name}`,
@@ -4765,7 +5078,7 @@ function apply(ctx, config) {
     if (!row) return void 0;
     return accounts.device(platform, userId, ltuid, async (device) => {
       const current = device || { deviceId: (0, import_node_crypto5.randomUUID)().replace(/-/g, ""), deviceFp: "" };
-      if (current.deviceFp && row.fpExpires && Number(row.fpExpires) > Date.now()) return current;
+      if (current.deviceFp && (!row.fpExpires || Number(row.fpExpires) > Date.now())) return current;
       try {
         const fp = await accounts.use(platform, userId, ltuid, "ck", (cookie) => client.fingerprint(current.deviceId, !(region.startsWith("cn_") || region.endsWith("_cn")), cookie));
         const updated = { deviceId: current.deviceId, deviceFp: fp };
@@ -4859,11 +5172,15 @@ function apply(ctx, config) {
         if (!stoken || !/^\d{1,20}$/.test(ltuid) || !mid) return "\u626B\u7801\u8FD4\u56DE\u7684\u8D26\u53F7\u4FE1\u606F\u4E0D\u5B8C\u6574\uFF0C\u672A\u4FDD\u5B58\u3002";
         const ltoken = await client.qrExchange(stoken, mid);
         const token = `stuid=${ltuid};stoken=${stoken};mid=${mid};ltoken=${ltoken};`;
+        await accounts.saveToken(...owner, ltuid, token);
         const cookie = await client.exchangeCookie(token, ltuid);
         const roles = await client.discover(cookie);
-        if (!roles.length) return "\u5DF2\u786E\u8BA4\u626B\u7801\uFF0C\u4F46\u672A\u67E5\u8BE2\u5230\u6E38\u620F\u89D2\u8272\uFF0C\u672A\u4FDD\u5B58\u51ED\u8BC1\u3002";
+        if (!roles.length) {
+          const previous = (await accounts.roles(...owner)).filter((role) => role.ltuid === ltuid && gameNames.includes(role.game)).map((role) => ({ game: role.game, uid: role.uid, region: role.region }));
+          await accounts.save(...owner, ltuid, cookie, previous);
+          return `\u901A\u884C\u8BC1 ${ltuid} \u7684\u51ED\u8BC1\u5DF2\u4FDD\u5B58\uFF0C\u6682\u672A\u53D1\u73B0\u6E38\u620F\u89D2\u8272\uFF1B\u4E0B\u6B21\u9762\u677F\u6216\u8BB0\u5F55\u67E5\u8BE2\u4F1A\u91CD\u65B0\u540C\u6B65\u3002`;
+        }
         await accounts.save(...owner, ltuid, cookie, roles);
-        await accounts.saveToken(...owner, ltuid, token);
         return `\u901A\u884C\u8BC1 ${ltuid} \u5DF2\u7ED1\u5B9A\uFF1A${roles.map((role) => `${role.game} ${role.uid}`).join("\u3001")}\u3002`;
       }
       return "\u626B\u7801\u8D85\u65F6\uFF0C\u8BF7\u91CD\u65B0\u53D1\u8D77\u3002";
@@ -4951,22 +5268,31 @@ ${roles.filter((role) => role.ltuid === row.ltuid).map((role) => `  ${role.game}
     if (!owner || !passportId.test(ltuid || "")) return "\u7528\u6CD5\uFF1A\u79C1\u804A mys.token.remove \u901A\u884C\u8BC1ID\u3002";
     return await accounts.removeToken(...owner, ltuid) ? "SToken \u5DF2\u5220\u9664\uFF0C\u6E38\u620F CK \u4E0D\u53D7\u5F71\u54CD\u3002" : "\u672A\u627E\u5230\u8BE5 SToken\u3002";
   });
-  ctx.command("mys.auto <ltuid:string> <state:string>", "\u542F\u505C\u5F53\u524D\u901A\u884C\u8BC1\u6E38\u620F\u81EA\u52A8\u7B7E\u5230").action(async ({ session }, ltuid, state) => {
+  ctx.command("mys.auto <stateOrLtuid:string> [ltuidOrState:string]", "\u542F\u505C\u5F53\u524D\u901A\u884C\u8BC1\u6E38\u620F\u81EA\u52A8\u7B7E\u5230").action(async ({ session }, first, second) => {
     if (!session) return;
     const owner = identity(session);
-    if (!owner || !passportId.test(ltuid || "") || !["on", "off"].includes(state)) return "\u7528\u6CD5\uFF1A\u79C1\u804A mys.auto \u901A\u884C\u8BC1ID on|off\u3002";
+    if (!owner) return "\u4EC5\u652F\u6301\u79C1\u804A\u3002";
+    const selected = await togglePassport(owner, first, second, "cookie");
+    if ("error" in selected) return selected.error;
+    const { ltuid, state } = selected;
     return await accounts.setEnabled(...owner, ltuid, state === "on") ? "\u81EA\u52A8\u7B7E\u5230\u8BBE\u7F6E\u5DF2\u66F4\u65B0\u3002" : "\u672A\u627E\u5230\u8BE5\u901A\u884C\u8BC1\u3002";
   });
-  ctx.command("mys.community.auto <ltuid:string> <state:string>", "\u542F\u505C\u72EC\u7ACB\u5B9A\u65F6\u793E\u533A\u7B7E\u5230").action(async ({ session }, ltuid, state) => {
+  ctx.command("mys.community.auto <stateOrLtuid:string> [ltuidOrState:string]", "\u542F\u505C\u72EC\u7ACB\u5B9A\u65F6\u793E\u533A\u7B7E\u5230").action(async ({ session }, first, second) => {
     if (!session) return;
     const owner = identity(session);
-    if (!owner || !passportId.test(ltuid || "") || !["on", "off"].includes(state)) return "\u7528\u6CD5\uFF1A\u79C1\u804A mys.community.auto \u901A\u884C\u8BC1ID on|off\u3002";
+    if (!owner) return "\u4EC5\u652F\u6301\u79C1\u804A\u3002";
+    const selected = await togglePassport(owner, first, second, "stoken");
+    if ("error" in selected) return selected.error;
+    const { ltuid, state } = selected;
     return await accounts.setCommunityEnabled(...owner, ltuid, state === "on") ? `\u793E\u533A\u72EC\u7ACB\u5B9A\u65F6\u7B7E\u5230\u5DF2${state === "on" ? "\u5F00\u542F\uFF0C\u8DDF\u968F\u6A21\u5F0F\u5DF2\u5173\u95ED" : "\u5173\u95ED"}\u3002` : "\u672A\u627E\u5230\u8BE5\u901A\u884C\u8BC1\u7684 SToken\u3002";
   });
-  ctx.command("mys.community.follow <ltuid:string> <state:string>", "\u542F\u505C\u8DDF\u968F\u6E38\u620F\u7B7E\u5230\u7684\u793E\u533A\u7B7E\u5230").action(async ({ session }, ltuid, state) => {
+  ctx.command("mys.community.follow <stateOrLtuid:string> [ltuidOrState:string]", "\u542F\u505C\u8DDF\u968F\u6E38\u620F\u7B7E\u5230\u7684\u793E\u533A\u7B7E\u5230").action(async ({ session }, first, second) => {
     if (!session) return;
     const owner = identity(session);
-    if (!owner || !passportId.test(ltuid || "") || !["on", "off"].includes(state)) return "\u7528\u6CD5\uFF1A\u79C1\u804A mys.community.follow \u901A\u884C\u8BC1ID on|off\u3002";
+    if (!owner) return "\u4EC5\u652F\u6301\u79C1\u804A\u3002";
+    const selected = await togglePassport(owner, first, second, "stoken");
+    if ("error" in selected) return selected.error;
+    const { ltuid, state } = selected;
     return await accounts.setFollowMissions(...owner, ltuid, state === "on") ? `\u8DDF\u968F\u6E38\u620F\u7684\u793E\u533A\u7B7E\u5230\u5DF2${state === "on" ? "\u5F00\u542F\uFF0C\u72EC\u7ACB\u5B9A\u65F6\u5DF2\u5173\u95ED" : "\u5173\u95ED"}\u3002` : "\u672A\u627E\u5230\u8BE5\u901A\u884C\u8BC1\u7684 SToken\u3002";
   });
   ctx.command("mys.device.bind <ltuid:string> <deviceId:string> <deviceFp:string>", "\u7ED1\u5B9A\u5F53\u524D\u901A\u884C\u8BC1\u7684\u8BBE\u5907\u8D44\u6599").action(async ({ session }, ltuid, deviceId, deviceFp) => {
@@ -5011,40 +5337,38 @@ ${roles.filter((role) => role.ltuid === row.ltuid).map((role) => `  ${role.game}
     }
     return output.join("\n");
   });
-  ctx.command("mys.record <game:string> <type:string> [uid:string] [period:string]", "\u67E5\u8BE2\u5F53\u524D\u6E38\u620F UID \u7684\u8BB0\u5F55").action(async ({ session }, game, type, uid, period) => {
+  ctx.command("mys.record <game:string> [type:string] [uid:string] [period:string]", "\u67E5\u8BE2\u5F53\u524D\u6E38\u620F UID \u7684\u8BB0\u5F55").action(async ({ session }, game, type = "overview", uid, period) => {
     if (!session) return;
-    const owner = identity(session);
-    if (!owner || !(game in recordTypes) || !type || !["1", "2", "3", void 0].includes(period)) return "\u7528\u6CD5\uFF1A\u79C1\u804A mys.record \u6E38\u620F\u4EE3\u53F7 \u7C7B\u578B [UID] [1|2|3]\u3002";
-    const roles = (await accounts.roles(...owner)).filter((role2) => role2.game === game);
+    const owner = identity(session, true);
+    if (!owner || !Object.hasOwn(recordTypes, game) || !["1", "2", "3", void 0].includes(period)) return "\u7528\u6CD5\uFF1Amys.record \u6E38\u620F\u4EE3\u53F7 [\u7C7B\u578B] [UID] [1|2|3]\u3002";
+    const roles = await queryRoles(owner, game);
     if (["1", "2", "3"].includes(uid || "") && !period) {
       period = uid;
       uid = void 0;
     }
-    const role = uid ? roles.find((role2) => role2.uid === uid) : roles.find((role2) => role2.current);
+    const role = uid ? roles.find((role2) => role2.uid === uid) : roles.find((role2) => role2.current) || roles[0];
     if (!role) return "\u6CA1\u6709\u6B64\u6E38\u620F\u7684\u5F53\u524D UID \u6216\u6307\u5B9A UID \u672A\u7ED1\u5B9A\u3002";
     if (!Object.hasOwn(recordTypes[game], type)) return `\u53EF\u7528\u7C7B\u578B\uFF1A${Object.keys(recordTypes[game]).join("\u3001")}\u3002`;
     try {
-      const summary = await accounts.use(...owner, role.ltuid, "ck", async (cookie) => records.query(role, cookie, type, period === "2" ? 2 : period === "3" ? 3 : 1, await refreshDevice(...owner, role.ltuid, role.region)));
-      if (type !== "panel" || /失败|无法|未能|没有|不支持/.test(summary)) return summary;
-      const structured = await accounts.use(...owner, role.ltuid, "ck", async (cookie) => records.queryPanel(role, cookie, await refreshDevice(...owner, role.ltuid, role.region)));
-      if (typeof structured === "string") return structured;
-      const snapshot = await panel.save(role, `${game === "gs" ? "\u539F\u795E" : "\u661F\u7A79\u94C1\u9053"}\u89D2\u8272\u9762\u677F`, panelSummary(structured), structured);
-      try {
-        return await panel.render(snapshot);
-      } catch {
-        return `${summary}
-\u9762\u677F\u5FEB\u7167\u5DF2\u4FDD\u5B58\uFF0C\u4F46 Puppeteer \u6E32\u67D3\u4E0D\u53EF\u7528\u3002`;
+      if (["gs", "sr"].includes(game) && ["panel", "overview"].includes(type)) {
+        const overview = await accounts.use(...owner, role.ltuid, "ck", async (cookie) => records.queryAccount(role, cookie, await refreshDevice(...owner, role.ltuid, role.region), type === "overview"));
+        if (typeof overview === "string") return overview;
+        if (type === "panel") return await panel.renderAccount(overview, session.author.avatar || session.event.user?.avatar);
+        if (game !== "sr") return formatAccountOverview(overview);
+        overview.stamina = await accounts.use(...owner, role.ltuid, "ck", async (cookie) => records.queryStamina(role, cookie, await refreshDevice(...owner, role.ltuid, role.region)));
+        return await panel.renderRecordOverview(overview, session.author.avatar || session.event.user?.avatar);
       }
+      return await accounts.use(...owner, role.ltuid, "ck", async (cookie) => records.query(role, cookie, type, period === "2" ? 2 : period === "3" ? 3 : 1, await refreshDevice(...owner, role.ltuid, role.region)));
     } catch (error) {
       return `\u8BB0\u5F55\u67E5\u8BE2\u5931\u8D25\uFF1A${error instanceof Error ? error.message : "\u8BF7\u68C0\u67E5\u51ED\u8BC1\u3001\u7F51\u7EDC\u4E0E\u6570\u636E\u516C\u5F00\u6743\u9650\u3002"}`;
     }
   });
-  ctx.command("mys.character <game:string> <character:text> [uid:string]", "\u67E5\u8BE2\u6307\u5B9A\u89D2\u8272\u7684\u8BE6\u7EC6\u9762\u677F").action(async ({ session }, game, character, uid) => {
+  ctx.command("mys.character <game:string> <character:string> [uid:string]", "\u67E5\u8BE2\u6307\u5B9A\u89D2\u8272\u7684\u8BE6\u7EC6\u9762\u677F").action(async ({ session }, game, character, uid) => {
     if (!session) return;
-    const owner = identity(session);
-    if (!owner || !["gs", "sr"].includes(game) || !character?.trim()) return "\u7528\u6CD5\uFF1A\u79C1\u804A mys.character gs|sr \u89D2\u8272\u540D [UID]\u3002";
-    const roles = (await accounts.roles(...owner)).filter((role2) => role2.game === game);
-    const role = uid ? roles.find((item) => item.uid === uid) : roles.find((item) => item.current);
+    const owner = identity(session, true);
+    if (!owner || !["gs", "sr"].includes(game) || !character?.trim()) return "\u7528\u6CD5\uFF1Amys.character gs|sr \u89D2\u8272\u540D [UID]\u3002";
+    const roles = await queryRoles(owner, game);
+    const role = uid ? roles.find((item) => item.uid === uid) : roles.find((item) => item.current) || roles[0];
     if (!role) return "\u6CA1\u6709\u6B64\u6E38\u620F\u7684\u5F53\u524D UID \u6216\u6307\u5B9A UID \u672A\u7ED1\u5B9A\u3002";
     try {
       const structured = await accounts.use(...owner, role.ltuid, "ck", async (cookie) => records.queryPanel(role, cookie, await refreshDevice(...owner, role.ltuid, role.region), character.trim()));
@@ -5055,23 +5379,19 @@ ${roles.filter((role) => role.ltuid === row.ltuid).map((role) => `  ${role.game}
       return `\u89D2\u8272\u9762\u677F\u67E5\u8BE2\u5931\u8D25\uFF1A${error instanceof Error ? error.message : "\u8BF7\u68C0\u67E5\u51ED\u8BC1\u3001\u7F51\u7EDC\u4E0E\u6570\u636E\u516C\u5F00\u6743\u9650\u3002"}`;
     }
   });
-  ctx.command("mys.panel <game:string> [uid:string]", "\u67E5\u770B\u5DF2\u4FDD\u5B58\u7684\u56FE\u7247\u9762\u677F").action(async ({ session }, game, uid) => {
+  ctx.command("mys.panel [game:string] [uid:string]", "\u67E5\u770B\u6E38\u620F\u8D26\u53F7\u5934\u50CF\u3001UID \u4E0E\u89D2\u8272\u7ACB\u7ED8\uFF0C\u9ED8\u8BA4\u661F\u7A79\u94C1\u9053").action(async ({ session }, game = "sr", uid) => {
     if (!session) return;
-    const owner = identity(session);
-    if (!owner || !["gs", "sr"].includes(game)) return "\u7528\u6CD5\uFF1A\u79C1\u804A mys.panel gs|sr [UID]\u3002";
-    const roles = (await accounts.roles(...owner)).filter((role2) => role2.game === game);
-    const role = uid ? roles.find((role2) => role2.uid === uid) : roles.find((role2) => role2.current);
+    const owner = identity(session, true);
+    if (!owner || !["gs", "sr"].includes(game)) return "\u7528\u6CD5\uFF1Amys.panel [gs|sr] [UID]\u3002";
+    const roles = await queryRoles(owner, game);
+    const role = uid ? roles.find((role2) => role2.uid === uid) : roles.find((role2) => role2.current) || roles[0];
     if (!role) return "\u6CA1\u6709\u5DF2\u7ED1\u5B9A\u7684\u6E38\u620F\u89D2\u8272\u3002";
     try {
-      let snapshot = await panel.get(...owner, role);
-      if (!snapshot) {
-        const structured = await accounts.use(...owner, role.ltuid, "ck", async (cookie) => records.queryPanel(role, cookie, await refreshDevice(...owner, role.ltuid, role.region)));
-        if (typeof structured === "string") return structured;
-        snapshot = await panel.save(role, `${game === "gs" ? "\u539F\u795E" : "\u661F\u7A79\u94C1\u9053"}\u89D2\u8272\u9762\u677F`, panelSummary(structured), structured);
-      }
-      return await panel.render(snapshot);
+      const overview = await accounts.use(...owner, role.ltuid, "ck", async (cookie) => records.queryAccount(role, cookie, await refreshDevice(...owner, role.ltuid, role.region)));
+      if (typeof overview === "string") return overview;
+      return await panel.renderAccount(overview, session.author.avatar || session.event.user?.avatar);
     } catch (error) {
-      return `\u9996\u6B21\u67E5\u8BE2\u6216\u9762\u677F\u6E32\u67D3\u5931\u8D25\uFF1A${error instanceof Error ? error.message : "\u8BF7\u68C0\u67E5\u51ED\u8BC1\u3001\u7F51\u7EDC\u3001\u6570\u636E\u516C\u5F00\u6743\u9650\u53CA Puppeteer \u670D\u52A1\u3002"}`;
+      return `\u8D26\u53F7\u6982\u89C8\u67E5\u8BE2\u6216\u6E32\u67D3\u5931\u8D25\uFF1A${error instanceof Error ? error.message : "\u8BF7\u68C0\u67E5\u51ED\u8BC1\u3001\u7F51\u7EDC\u3001\u6570\u636E\u516C\u5F00\u6743\u9650\u53CA Puppeteer \u670D\u52A1\u3002"}`;
     }
   });
   ctx.command("mys.migrate <slot:string>", "\u663E\u5F0F\u8FC1\u79FB\u65E7\u7248\u69FD\u4F4D\u51ED\u8BC1").action(async ({ session }, slot) => {

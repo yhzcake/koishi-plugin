@@ -124,8 +124,27 @@ export interface PanelData {
     server: string;
     characters: PanelCharacter[];
 }
+export interface AccountOverviewCharacter {
+    id: string;
+    name: string;
+    avatar?: string;
+}
+export interface AccountOverview {
+    game: 'gs' | 'sr';
+    uid: string;
+    nickname: string;
+    avatar?: string;
+    characters: AccountOverviewCharacter[];
+    level?: string;
+    server?: string;
+    stamina?: Record<string, unknown>;
+    challenges?: Record<string, Record<string, unknown>>;
+}
 export declare function formatRecord(label: string, data: unknown): string;
+export declare function formatAccountOverview(data: AccountOverview): string;
 export declare function createRecords(client: ReturnType<typeof createClient>, cache?: StaticCache): {
     query: (account: GameRole, secret: string, type: string, schedule?: 1 | 2 | 3, device?: DeviceInfo, character?: string) => Promise<string>;
     queryPanel: (account: GameRole, secret: string, device?: DeviceInfo, character?: string) => Promise<PanelData | string>;
+    queryAccount: (account: GameRole, secret: string, device?: DeviceInfo, includeChallenges?: boolean) => Promise<AccountOverview | string>;
+    queryStamina: (account: GameRole, secret: string, device?: DeviceInfo) => Promise<Record<string, unknown>>;
 };

@@ -1,6 +1,6 @@
 import { Context } from 'koishi';
 import { GameRole } from './accounts';
-import { PanelData } from './records';
+import { AccountOverview, PanelData } from './records';
 export interface PanelSnapshot {
     id: string;
     platform: string;
@@ -18,6 +18,8 @@ declare module 'koishi' {
     }
 }
 export declare function createPanel(ctx: Context): {
+    renderAccount(data: AccountOverview, userAvatar?: string): Promise<string>;
+    renderRecordOverview(data: AccountOverview, userAvatar?: string): Promise<string>;
     save(role: GameRole, title: string, summary: string, data?: PanelData): Promise<PanelSnapshot>;
     get(platform: string, userId: string, role: GameRole): Promise<PanelSnapshot>;
     remove(platform: string, userId: string, roles: GameRole[]): Promise<void>;

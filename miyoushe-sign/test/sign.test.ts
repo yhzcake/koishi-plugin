@@ -171,12 +171,23 @@ test('record requires ownership and queries SR challenge types', async () => {
   const records = createRecords(createClient(ctx as never, 5000, 0))
   const role = { game: 'sr', uid: '200', region: 'prod_gf_cn' } as GameRole
   assert.match(await records.query(role, 'ck', 'forgotten'), /未绑定该游戏 UID/)
-  assert.equal(calls.length, 1)
+  assert.equal(calls.length, 2)
   owned = true
   for (const [type, path] of [['forgotten', 'challenge'], ['fiction', 'challenge_story'], ['apocalypse', 'challenge_boss'], ['anomaly', 'challenge_peak']] as const) {
-    assert.match(await records.query(role, 'ck', type, 2), /total_star：36/)
+    const output = await records.query(role, 'ck', type, 2)
+    assert.match(output, type === 'anomaly' ? /暂无王棋记录/ : /总星数：36/)
     assert.ok(calls.at(-1)!.includes(`/hkrpg/api/${path}?`))
   }
+})
+
+test('SR forgotten formats max floor and stars without exposing API field names', async () => {
+  const ctx = { http: async (url: string) => ({ status: 200, data: url.includes('/binding/')
+    ? { retcode: 0, data: { list: [{ game_biz: 'hkrpg_cn', game_uid: '200', region: 'prod_gf_cn' }] } }
+    : { retcode: 0, data: { max_floor: '混沌回忆·第12层', all_floor_detail: [{ name: '混沌回忆·第12层', star_num: 3 }] } } }) }
+  const records = createRecords(createClient(ctx as never, 5000, 0))
+  const output = await records.query({ game: 'sr', uid: '200', region: 'prod_gf_cn' } as GameRole, 'ck', 'forgotten')
+  assert.match(output, /最高通关：混沌回忆·第12层（3 星）/)
+  assert.doesNotMatch(output, /max_floor|all_floor_detail/)
 })
 
 test('SR challenge selects active group and combines floor node scores', async () => {
@@ -192,9 +203,44 @@ test('SR challenge selects active group and combines floor node scores', async (
   const role = { game: 'sr', uid: '200', region: 'prod_gf_cn' } as GameRole
   assert.match(await records.query(role, 'ck', 'fiction', 1), /新一期/)
   assert.match(await records.query(role, 'ck', 'fiction', 2), /旧一期/)
-  assert.match(await records.query(role, 'ck', 'fiction', 1), /第一关：300/)
+  assert.match(await records.query(role, 'ck', 'fiction', 1), /关卡：第一关，得分 300/)
   assert.match(await records.query(role, 'ck', 'overview'), /Story：10\/12/)
   assert.ok(calls.some(url => url.includes('/challenge_brief?')))
+})
+
+test('SR challenge_peak formats the group and boss and knight stars', async () => {
+  const ctx = { http: async (url: string) => {
+    if (url.includes('/binding/')) return { status: 200, data: { retcode: 0, data: { list: [{ game_biz: 'hkrpg_cn', game_uid: '200', region: 'prod_gf_cn' }] } } }
+    return { status: 200, data: { retcode: 0, data: { challenge_peak_records: [
+      { group: { name_mi18n: '王棋赛季', begin_time: '2026-10-01' }, boss_stars: 3, mob_stars: 6, boss_record: { has_challenge_record: true }, boss_info: { name_mi18n: '末日兽' } },
+      { group: { name_mi18n: '上期王棋' }, boss_stars: 1, mob_stars: 2 },
+    ], challenge_peak_best_record_brief: { total_battle_num: 4 } } } }
+  } }
+  const records = createRecords(createClient(ctx as never, 5000, 0))
+  const role = { game: 'sr', uid: '200', region: 'prod_gf_cn' } as GameRole
+  const output = await records.query(role, 'ck', 'anomaly')
+  assert.match(output, /周期：王棋赛季/)
+  assert.match(output, /王棋：末日兽（3 星）/)
+  assert.match(output, /骑士：6 星/)
+  assert.match(output, /战斗次数：4/)
+  assert.doesNotMatch(output, /challenge_peak_records|boss_stars/)
+})
+
+test('SR apocalypse formats floor progress in readable labels', async () => {
+  const ctx = { http: async (url: string) => {
+    if (url.includes('/binding/')) return { status: 200, data: { retcode: 0, data: { list: [{ game_biz: 'hkrpg_cn', game_uid: '200', region: 'prod_gf_cn' }] } } }
+    return { status: 200, data: { retcode: 0, data: {
+      groups: [{ status: 'New', name: '本期末日幻影', total_star: 4 }],
+      max_floor: '支配遗忘·难度04',
+      all_floor_detail: [{ name: '支配遗忘·难度04星启模式', star_num: 4, score: 10241 }],
+    } } }
+  } }
+  const records = createRecords(createClient(ctx as never, 5000, 0))
+  const role = { game: 'sr', uid: '200', region: 'prod_gf_cn' } as GameRole
+  const output = await records.query(role, 'ck', 'apocalypse')
+  assert.match(output, /赛季：本期末日幻影/)
+  assert.match(output, /最高通关：支配遗忘·难度04星启模式（4 星），得分 10241/)
+  assert.doesNotMatch(output, /max_floor|total_star|关卡数量/)
 })
 
 test('QR exchange and CK refresh never expose tokens in URL', async () => {
@@ -209,10 +255,47 @@ test('QR exchange and CK refresh never expose tokens in URL', async () => {
   const client = createClient(ctx as never, 5000, 0)
   assert.equal((await client.qrCreate()).ticket, 'ticket')
   assert.equal((await client.qrStatus('ticket')).data?.status, 'Confirmed')
-  assert.equal(await client.qrExchange('stoken-value', 'mid'), 'ltoken-value')
+  assert.equal(await client.qrExchange('stoken-value', 123456789), 'ltoken-value')
   assert.match(await client.exchangeCookie('stuid=123;stoken=stoken-value;ltoken=ltoken-value', '123'), /cookie_token=cookie-value/)
   assert.ok(calls.every(call => !call.url.includes('stoken-value')))
   assert.equal(calls[2].options.data.src_token.token, 'stoken-value')
+  assert.equal(calls[2].options.data.mid, 123456789)
+})
+
+test('v2 CK 换取保留完整认证字段并用于后续请求', async () => {
+  const calls: { url: string; options: any }[] = []
+  const secret = 'stuid=123;stoken_v2=stoken-v2;ltoken_v2=ltoken-v2==;ltmid_v2=mid-v2;account_mid_v2=account-mid-v2;'
+  const ctx = { http: async (url: string, options: any) => {
+    calls.push({ url, options })
+    if (url.includes('getCookieAccountInfoBySToken')) {
+      assert.equal(options.headers.Cookie, secret)
+      return { status: 200, data: { retcode: 0, data: { cookie_token_v2: 'cookie-v2==' } } }
+    }
+    assert.equal(options.headers.Cookie, 'ltuid=123;account_mid_v2=account-mid-v2;cookie_token_v2=cookie-v2==;ltoken_v2=ltoken-v2==;ltmid_v2=mid-v2;')
+    return { status: 200, data: { retcode: 0, data: {} } }
+  } }
+  const client = createClient(ctx as never, 5000, 0)
+  const cookie = await client.exchangeCookie(secret, '123')
+  assert.equal(cookie, 'ltuid=123;account_mid_v2=account-mid-v2;cookie_token_v2=cookie-v2==;ltoken_v2=ltoken-v2==;ltmid_v2=mid-v2;')
+  await client.record('https://api-takumi-record.mihoyo.com/game_record/app/hkrpg/api/index', cookie)
+  assert.equal(calls.length, 2)
+  assert.ok(calls.every(call => !call.url.includes('stoken-v2') && !call.url.includes('cookie-v2')))
+})
+
+test('传统 CK 响应仍保留 v2 LToken 与 mid 认证字段', async () => {
+  const calls: { url: string; options: any }[] = []
+  const secret = 'stuid=123;stoken_v2=stoken-v2;ltoken_v2=ltoken-v2==;ltmid_v2=mid-v2;account_mid_v2=account-mid-v2;'
+  const ctx = { http: async (url: string, options: any) => {
+    calls.push({ url, options })
+    if (url.includes('getCookieAccountInfoBySToken')) return { status: 200, data: { retcode: 0, data: { cookie_token: 'cookie-value' } } }
+    assert.equal(options.headers.Cookie, 'ltoken_v2=ltoken-v2==;ltmid_v2=mid-v2;account_mid_v2=account-mid-v2;ltuid=123;cookie_token=cookie-value;account_id=123;')
+    return { status: 200, data: { retcode: 0, data: {} } }
+  } }
+  const client = createClient(ctx as never, 5000, 0)
+  const cookie = await client.exchangeCookie(secret, '123')
+  assert.equal(cookie, 'ltoken_v2=ltoken-v2==;ltmid_v2=mid-v2;account_mid_v2=account-mid-v2;ltuid=123;cookie_token=cookie-value;account_id=123;')
+  await client.record('https://api-takumi-record.mihoyo.com/game_record/app/hkrpg/api/index', cookie)
+  assert.equal(calls.length, 2)
 })
 
 test('device fingerprint uses scoped host and preserves device ID', async () => {

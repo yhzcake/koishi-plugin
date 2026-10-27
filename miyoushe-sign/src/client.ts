@@ -40,6 +40,7 @@ export function createClient(ctx: Context, timeout: number, interval: number) {
   let queue: Promise<unknown> = Promise.resolve()
   const qrDeviceId = randomUUID()
   const qrLifecycleId = randomUUID()
+  const recordDeviceId = randomUUID().replace(/-/g, '')
 
   async function request(url: string, secret: string, method: 'GET' | 'POST', body?: object, community = false, device?: DeviceInfo): Promise<Result> {
     const hostname = new URL(url).hostname
@@ -94,7 +95,7 @@ export function createClient(ctx: Context, timeout: number, interval: number) {
         headers['x-rpc-csm_source'] = 'myself'
         headers['x-rpc-platform'] = 'android'
         headers['x-rpc-channel'] = overseas ? 'google' : 'miyousheluodi'
-        headers['x-rpc-sys_version'] = '13'
+        headers['x-rpc-sys_version'] = '12'
         headers.DS = recordDs(new URL(url).search.slice(1), body ? JSON.stringify(body) : '', hostname.endsWith('mihoyo.com'))
       } else if (community) {
         headers.DS = method === 'POST' && body
@@ -104,20 +105,32 @@ export function createClient(ctx: Context, timeout: number, interval: number) {
         headers.DS = ds('jEpJb9rRARU2rXDA9qYbZ3selxkuct9a')
       }
       if (device?.deviceId) headers['x-rpc-device_id'] = device.deviceId
+      else if (hostname === 'api-takumi-record.mihoyo.com' || hostname === 'sg-act-public-api.hoyolab.com' && url.includes('/game_record/')) headers['x-rpc-device_id'] = recordDeviceId
       if (device?.deviceFp) headers['x-rpc-device_fp'] = device.deviceFp
       if (device && (hostname === 'api-takumi-record.mihoyo.com' || hostname.includes('public-data-api.'))) {
         headers['x-rpc-device_name'] ||= 'Sony XQ-BC52'
         headers['x-rpc-device_model'] ||= 'XQ-BC52'
         headers['x-rpc-platform'] ||= 'android'
-        headers['x-rpc-sys_version'] ||= '13'
+        headers['x-rpc-sys_version'] ||= '12'
       }
+      // #region debug-point A:record-request
+      const recordTraceId = randomUUID()
+      if (hostname.includes('record') || hostname.includes('public-data')) {
+        const query = new URL(url).searchParams
+        ctx.logger?.info(`[record-debug] trace=${recordTraceId} stage=request method=${method} path=${new URL(url).pathname} schedule=${query.get('schedule_type') || '-'} isPrev=${query.has('isPrev')} needAll=${query.get('need_all') || '-'} deviceId=${headers['x-rpc-device_id'] ? 'present' : 'missing'} deviceFp=${headers['x-rpc-device_fp'] ? 'present' : 'missing'} sys=${headers['x-rpc-sys_version'] || '-'} signgame=${headers['x-rpc-signgame'] || '-'} queueWaitMs=${delay}`)
+      }
+      // #endregion
       const response = await ctx.http(url, { method, headers, data: body, timeout, redirect: 'error' })
       if (response.status < 200 || response.status >= 300) throw new Error(`HTTP ${response.status}`)
       const result = response.data as Result
       if (!result || typeof result.retcode !== 'number') throw new Error('接口响应格式错误')
-      if (process.env.MIYOUSHE_DEBUG_RECORD === '1' && (hostname.includes('record') || hostname.includes('public-data'))) {
-        ctx.logger.info(`[record-debug] ${method} ${new URL(url).pathname} retcode=${result.retcode} message=${result.message || '-'} device=${device?.deviceId ? 'id' : '-'} fp=${device?.deviceFp ? 'fp' : '-'}`)
+      // #region debug-point B:record-response
+      if (hostname.includes('record') || hostname.includes('public-data')) {
+        const message = result.message || ''
+        const messageClass = /cookie|token|login|auth/i.test(message) ? 'auth' : /device|fingerprint|设备/i.test(message) ? 'device' : /captcha|verify|验证|验证码/i.test(message) ? 'verification' : message ? 'other' : 'none'
+        ctx.logger?.info(`[record-debug] trace=${recordTraceId} stage=response path=${new URL(url).pathname} status=${response.status} retcode=${result.retcode} messageClass=${messageClass}`)
       }
+      // #endregion
       return result
     })
     queue = task.then(() => {}, () => {})
@@ -137,21 +150,40 @@ export function createClient(ctx: Context, timeout: number, interval: number) {
     async qrStatus(ticket: string) {
       return request('https://passport-api.miyoushe.com/account/ma-cn-passport/app/queryQRLoginStatus', '', 'POST', { ticket })
     },
-    async qrExchange(stoken: string, mid: string) {
+    async qrExchange(stoken: string, mid: string | number) {
       const result = await request('https://passport-api.miyoushe.com/account/ma-cn-session/app/exchange', '', 'POST', { src_token: { token: stoken, token_type: 1 }, mid, dst_token_type: 4 })
       const token = (result.data?.token as Record<string, unknown> | undefined)?.token
       if (result.retcode !== 0 || typeof token !== 'string' || !/^[^;\s\x00-\x1f]{1,2048}$/.test(token)) throw new Error('LToken 换取失败。')
       return token
     },
     async exchangeCookie(secret: string, ltuid: string, gameBiz = 'hk4e_cn') {
+      if (secret.length > 4096 || /[\r\n\x00-\x1f]/.test(secret) || !/^\d{1,20}$/.test(ltuid)) throw new Error('SToken 数据不完整。')
+      const fields = new Map(secret.split(';').flatMap(segment => {
+        const index = segment.indexOf('=')
+        return index < 1 ? [] : [[segment.slice(0, index).trim(), segment.slice(index + 1).trim()] as const]
+      }))
+      const stoken = fields.get('stoken') || fields.get('stoken_v2')
+      const ltoken = fields.get('ltoken')
+      const ltokenV2 = fields.get('ltoken_v2')
+      const ltmidV2 = fields.get('ltmid_v2')
+      const accountMidV2 = fields.get('account_mid_v2')
+      const identities = ['ltuid', 'login_uid', 'stuid', 'account_id', 'ltuid_v2', 'account_id_v2'].map(name => fields.get(name)).filter((value): value is string => Boolean(value))
+      const validToken = (value?: string) => Boolean(value && /^[^;\s\x00-\x1f]{1,2048}$/.test(value))
+      if (!validToken(stoken) || !validToken(ltoken) && !validToken(ltokenV2) || !identities.length || identities.some(value => value !== ltuid)) throw new Error('SToken 数据不完整。')
+      if ((ltokenV2 && !validToken(ltokenV2)) || (ltmidV2 && !validToken(ltmidV2)) || (accountMidV2 && !validToken(accountMidV2))) throw new Error('SToken 数据不完整。')
       const overseas = gameBiz.endsWith('_global')
       const host = overseas ? 'https://sg-public-api.hoyolab.com' : 'https://api-takumi.mihoyo.com'
       const result = await request(`${host}/auth/api/getCookieAccountInfoBySToken?game_biz=${encodeURIComponent(gameBiz)}`, secret, overseas ? 'POST' : 'GET')
+      if (result.retcode !== 0) throw new Error('CK 换取失败。')
       const token = result.data?.cookie_token
-      if (result.retcode !== 0 || typeof token !== 'string' || !/^[^;\s\x00-\x1f]{1,2048}$/.test(token)) throw new Error('CK 换取失败。')
-      const ltoken = /(?:^|;)\s*ltoken=([^;]+)/.exec(secret)?.[1]
-      if (!ltoken || !/^[^;\s\x00-\x1f]{1,2048}$/.test(ltoken) || !/^\d{1,20}$/.test(ltuid)) throw new Error('SToken 数据不完整。')
-      return `ltoken=${ltoken};ltuid=${ltuid};cookie_token=${token};account_id=${ltuid};`
+      const tokenV2 = result.data?.cookie_token_v2
+      if (tokenV2 !== undefined) {
+        if (typeof tokenV2 !== 'string' || !validToken(tokenV2) || !ltokenV2 || !ltmidV2 || !accountMidV2) throw new Error('CK 换取失败。')
+        return `ltuid=${ltuid};account_mid_v2=${accountMidV2};cookie_token_v2=${tokenV2};ltoken_v2=${ltokenV2};ltmid_v2=${ltmidV2};`
+      }
+      if (typeof token !== 'string' || !/^[^;\s\x00-\x1f]{1,2048}$/.test(token)) throw new Error('CK 换取失败。')
+      if (!validToken(ltoken) && !validToken(ltokenV2)) throw new Error('CK 换取失败。')
+      return `${ltoken ? `ltoken=${ltoken};` : ''}${ltokenV2 ? `ltoken_v2=${ltokenV2};` : ''}${ltmidV2 ? `ltmid_v2=${ltmidV2};` : ''}${accountMidV2 ? `account_mid_v2=${accountMidV2};` : ''}ltuid=${ltuid};cookie_token=${token};account_id=${ltuid};`
     },
     async fingerprint(deviceId: string, overseas: boolean, secret: string) {
       if (!/^[a-zA-Z0-9_-]{8,128}$/.test(deviceId)) throw new Error('设备 ID 无效。')
@@ -183,6 +215,7 @@ export function createClient(ctx: Context, timeout: number, interval: number) {
             const region = String(item.region || '')
             return game && /^\d{1,20}$/.test(uid) && /^[a-zA-Z0-9_-]{2,40}$/.test(region) ? [{ game, uid, region }] : []
           })
+          if (!roles.length) continue
           return roles.filter((role, index) => roles.findIndex(other => other.game === role.game && other.uid === role.uid && other.region === role.region) === index)
         } catch {
           continue

@@ -1,6 +1,6 @@
-import { Context } from 'koishi'
+import { Context, h } from 'koishi'
 import { GameRole } from './accounts'
-import { PanelData, PanelCharacter, PanelRelic, PanelTrace } from './records'
+import { AccountOverview, PanelData, PanelCharacter, PanelRelic, PanelTrace } from './records'
 import type {} from 'koishi-plugin-puppeteer'
 
 export interface PanelSnapshot {
@@ -13,6 +13,83 @@ export interface PanelSnapshot {
   lines: string
   data?: string
   updatedAt: string
+}
+
+function recordValue(data: Record<string, unknown> | undefined, keys: string[]) {
+  for (const key of keys) {
+    const value = data?.[key]
+    if (value !== undefined && value !== null && value !== '') return String(value)
+  }
+  return undefined
+}
+
+function challengeText(data: Record<string, unknown> | undefined, keys: string[]) {
+  return recordValue(data, keys)
+}
+
+function stars(value: string | undefined, total = 3, extra = false) {
+  if (!value) return ''
+  const count = Math.max(0, Math.min(total, Number(value) || 0))
+  return `<span class="stars" aria-label="${escape(value)}星">${'★'.repeat(count)}${'☆'.repeat(total - count)}${extra ? '<i class="extra-star" title="星启模式">✦</i>' : ''}</span>`
+}
+
+function challengeFloor(data: Record<string, unknown>) {
+  const details = Array.isArray(data.all_floor_detail) ? data.all_floor_detail.filter(item => item && typeof item === 'object') as Record<string, unknown>[] : []
+  const maxFloor = challengeText(data, ['max_floor'])
+  const selected = maxFloor ? details.find(item => {
+    const name = challengeText(item, ['name', 'floor']) || ''
+    return name === maxFloor || name.startsWith(maxFloor) || maxFloor.startsWith(name)
+  }) : details.at(-1)
+  const floor = selected || (maxFloor ? { name: maxFloor } : undefined)
+  if (!floor) return undefined
+  const name = challengeText(floor, ['name', 'floor']) || maxFloor
+  const nodes = ['node_1', 'node_2', 'node_3'].map(key => floor[key]).filter(item => item && typeof item === 'object') as Record<string, unknown>[]
+  const nodeScores = nodes.map(node => Number(challengeText(node, ['score']))).filter(Number.isFinite)
+  const score = challengeText(floor, ['score']) || (nodeScores.length ? String(nodeScores.reduce((sum, item) => sum + item, 0)) : undefined)
+  const star = challengeText(floor, ['star_num', 'star', 'total_star']) || challengeText(data, ['star_num', 'total_star'])
+  const extraStar = challengeText(floor, ['extra_star_num']) || challengeText(data, ['extra_star_num'])
+  return name ? { name, score, star, extraStar } : undefined
+}
+
+function challengeRows(data: AccountOverview['challenges']) {
+  if (!data) return ''
+  const items = [
+    ['forgotten', '忘却之庭'],
+    ['fiction', '虚构叙事'],
+    ['apocalypse', '末日幻影'],
+  ].map(([key, label]) => {
+    const floor = challengeFloor(data[key] || {})
+    if (!floor) return ''
+    const baseStars = stars(floor.star)
+    const extraStar = Number(floor.extraStar) > 0
+    const starDisplay = `<span class="stars" aria-label="${escape(floor.star || '0')}星${extraStar ? '，含星启星' : ''}">${baseStars.replace(/^<span[^>]*>|<\/span>$/g, '')}${extraStar ? '<i class="extra-star" title="星启模式">✦</i>' : ''}</span>`
+    return `<div class="challenge-row"><strong>${label}</strong><span class="challenge-floor">${escape(floor.name)}</span><span class="challenge-result">${starDisplay}${floor.score ? `<small>得分 ${escape(floor.score)}</small>` : ''}</span></div>`
+  }).filter(Boolean).join('')
+  return items ? `<section class="challenge-list"><h2>挑战记录</h2>${items}</section>` : ''
+}
+
+function anomalyCard(data: Record<string, unknown> | undefined) {
+  if (!data) return ''
+  const peaks = Array.isArray(data.challenge_peak_records) ? data.challenge_peak_records : []
+  const peak = peaks[0] && typeof peaks[0] === 'object' ? peaks[0] as Record<string, unknown> : undefined
+  if (!peak) return ''
+  const group = peak.group && typeof peak.group === 'object' ? peak.group as Record<string, unknown> : undefined
+  const bossInfo = peak.boss_info && typeof peak.boss_info === 'object' ? peak.boss_info as Record<string, unknown> : undefined
+  const bossRecord = peak.boss_record && typeof peak.boss_record === 'object' ? peak.boss_record as Record<string, unknown> : undefined
+  const bossName = challengeText(bossInfo, ['name_mi18n', 'name'])
+  const bossStars = challengeText(peak, ['boss_stars']) || challengeText(bossRecord, ['star_num'])
+  const mobStars = challengeText(peak, ['mob_stars'])
+  const battle = challengeText(data.challenge_peak_best_record_brief as Record<string, unknown> | undefined, ['total_battle_num'])
+  if (!bossName && !bossStars && !mobStars && !battle) return ''
+  return `<section class="anomaly-card"><div class="anomaly-row"><strong>异相仲裁</strong><span class="anomaly-season">${escape(challengeText(group, ['name_mi18n', 'name']) || '本期')}</span><span class="anomaly-extra">${battle ? `挑战 ${escape(battle)} 次` : ''}</span></div><div class="anomaly-grid"><div><label>王棋</label><strong>${escape(bossName || '已记录')}</strong><span>${stars(bossStars, 3)}</span></div><div><label>骑士</label><strong>三关合计</strong><span class="mob-total">${escape(mobStars || '7')} 星</span></div></div></section>`
+}
+
+function serverName(region?: string) {
+  const names: Record<string, string> = {
+    prod_gf_cn: '星穹列车', prod_official_usa: 'America', prod_official_eur: 'Europe',
+    prod_official_asia: 'Asia', prod_official_cht: 'TW/HK/MO',
+  }
+  return region ? names[region] || region : '未知服务器'
 }
 
 declare module 'koishi' {
@@ -134,11 +211,72 @@ function renderHtml(ctx: Context, html: string) {
   })
 }
 
+function renderAccountHtml(ctx: Context, html: string, selector: string) {
+  if (!ctx.puppeteer) throw new Error('需要启用 Koishi puppeteer 服务。')
+  return ctx.puppeteer.render(html, async (page, next) => {
+    try {
+      await page.evaluate(async () => {
+        await Promise.all(Array.from(document.images).map(image => image.decode().catch(() => {})))
+      })
+      const target = await page.$(selector)
+      if (!target) throw new Error('账号概览渲染失败：未找到内容区域。')
+      const buffer = await target.screenshot({ type: 'jpeg', quality: 65 })
+      return h.image(buffer, 'image/jpeg').toString()
+    } catch (error) {
+      await page.close().catch(() => {})
+      throw error
+    }
+  })
+}
+
 export function createPanel(ctx: Context) {
   ctx.model.extend('miyoushe_panel', {
     id: 'string', platform: 'string', userId: 'string', game: 'string', uid: 'string', title: 'string', lines: 'text', data: 'text', updatedAt: 'string',
   }, { primary: 'id' })
   return {
+    async renderAccount(data: AccountOverview, userAvatar?: string) {
+      const characters = data.characters.length
+        ? data.characters.map(character => `<article class="character-card">${image(character.avatar, 'character-avatar')}<strong>${escape(character.name)}</strong></article>`).join('')
+        : '<div class="empty">暂无角色展示数据</div>'
+      const avatar = image(data.avatar || (userAvatar ? userAvatar.replace(/^http:\/\//i, 'https://') : undefined), 'account-avatar')
+      const title = data.nickname === '未知' ? `${data.game === 'gs' ? '原神' : '星穹铁道'}账号` : data.nickname
+      const html = `<html><head><meta charset="utf-8"><style>*{box-sizing:border-box}body{margin:0;padding:14px;width:640px;background:#111827;color:#f5f7fb;font-family:Arial,'Microsoft YaHei',sans-serif}.sheet{padding:14px;border:1px solid #46536b;border-radius:12px;background:#1b2537}.account-head{display:flex;align-items:center;gap:12px;padding-bottom:12px;border-bottom:1px solid #46536b}.account-avatar{width:56px;height:56px;border-radius:50%;object-fit:cover;background:#263149;border:2px solid #7384a7}.account-info{min-width:0}.account-info h1{margin:0 0 4px;font-size:18px;overflow-wrap:anywhere}.account-info small{color:#aebbd2;font-size:10px}.character-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;margin-top:12px}.character-card{overflow:hidden;border:1px solid #3a4862;border-radius:7px;background:#263149;text-align:center}.character-avatar{display:block;width:100%;aspect-ratio:3/4;object-fit:cover;background:#1b2537}.character-card strong{display:block;padding:5px 3px;font-size:10px;line-height:1.25;overflow-wrap:anywhere}.placeholder{display:flex;align-items:center;justify-content:center;color:#9caac2;font-size:10px}.empty{grid-column:1/-1;padding:20px;text-align:center;color:#aebbd2}</style></head><body><main class="sheet"><header class="account-head">${avatar}<div class="account-info"><h1>${escape(title)}</h1><small>UID ${escape(data.uid)}</small></div></header><section class="character-grid">${characters}</section></main></body></html>`
+      return renderAccountHtml(ctx, html, '.sheet')
+    },
+    async renderRecordOverview(data: AccountOverview, userAvatar?: string) {
+      const avatar = image(data.avatar || (userAvatar ? userAvatar.replace(/^http:\/\//i, 'https://') : undefined), 'account-avatar')
+      const title = data.nickname === '未知' ? '开拓者' : data.nickname
+      const noteData = data.stamina
+      const energy = noteData?.energy && typeof noteData.energy === 'object' ? noteData.energy as Record<string, unknown> : undefined
+      const current = recordValue(noteData, ['current_stamina']) || recordValue(energy, ['current']) || '暂无数据'
+      const max = recordValue(noteData, ['max_stamina']) || recordValue(energy, ['max'])
+      const reserve = recordValue(noteData, ['reserve_stamina']) || recordValue(noteData, ['backup_stamina']) || '0'
+      const trainValue = noteData?.weekly_train_score || noteData?.current_train_score
+      const train = trainValue && typeof trainValue === 'object' ? trainValue as Record<string, unknown> : undefined
+      const dailyCurrent = recordValue(train, ['current']) || recordValue(noteData, ['daily_train_score'])
+      const dailyMax = recordValue(train, ['max']) || recordValue(noteData, ['daily_train_score_max'])
+      const weeklyCurrent = recordValue(noteData, ['weekly_cocoon_cnt', 'weekly_echo_count'])
+      const weeklyLimit = recordValue(noteData, ['weekly_cocoon_cnt_max', 'weekly_echo_limit']) || '3'
+      const weeklyMax = weeklyCurrent !== undefined ? weeklyLimit : undefined
+      const cycleCurrent = recordValue(noteData, ['rogue_score', 'weekly_rogue_score', 'cycle_score'])
+      const cycleMax = recordValue(noteData, ['rogue_score_max', 'weekly_rogue_score_max', 'cycle_score_max'])
+      const value = (current: string | undefined, maximum?: string) => current ? `${current}${maximum ? `/${maximum}` : ''}` : '暂无数据'
+      const daily = dailyCurrent ? `${dailyCurrent}${dailyMax ? `/${dailyMax}` : ''}` : '暂无数据'
+      const weekly = weeklyCurrent ? `${weeklyCurrent}${weeklyMax ? `/${weeklyMax}` : ''}` : '暂无数据'
+      const cycle = cycleCurrent ? `${cycleCurrent}${cycleMax ? `/${cycleMax}` : ''}` : '暂无数据'
+      const rows = [
+        dailyCurrent ? `<div class="metric"><span>每日实训</span><b>${escape(daily)}</b></div>` : '',
+        weeklyCurrent ? `<div class="metric"><span>历战余响</span><b>${escape(weekly)}</b></div>` : '',
+        cycleCurrent ? `<div class="metric"><span>周期积分</span><b>${escape(cycle)}</b></div>` : '',
+      ].filter(Boolean).join('')
+      const stamina = current !== '暂无数据' ? `<div class="stamina"><strong>${escape(value(current, max))}</strong><small>开拓力${reserve !== '0' ? ` · 备用 ${escape(reserve)}` : ''}</small></div>` : ''
+      const metricContent = stamina && rows ? `${stamina}<div class="metrics">${rows}</div>` : stamina || rows
+      const note = metricContent ? `<section class="note ${stamina && rows ? '' : 'single'}">${metricContent}</section>` : ''
+      const challenges = challengeRows(data.challenges)
+      const anomaly = anomalyCard(data.challenges?.anomaly)
+      const html = `<html><head><meta charset="utf-8"><style>*{box-sizing:border-box}body{margin:0;padding:0;width:800px;background:#121826;color:#f5f7fb;font-family:Arial,'Microsoft YaHei',sans-serif}.overview{display:table;overflow:hidden;border:1px solid #39465d;border-radius:10px;background:#1b2537}.hero{min-height:150px;display:flex;align-items:center;gap:22px;padding:18px 26px;background:linear-gradient(100deg,#74604b,#323d50 68%,#202b40)}.account-avatar{width:104px;height:104px;border:3px solid #e7d49e;border-radius:50%;object-fit:cover;background:#263149}.identity{min-width:0}.nickname{font-size:34px;font-weight:600;overflow-wrap:anywhere}.nickname small{font-size:18px}.details{margin-top:8px;font-size:20px;color:#e3e8f2}.details span{margin-right:16px}.note{display:grid;grid-template-columns:minmax(180px,1fr) minmax(300px,1fr);gap:0;padding:20px 24px;background:#f1f0ed;color:#282a30}.note.single{grid-template-columns:1fr}.stamina{display:flex;flex-direction:column;justify-content:center;padding:4px 24px;border-right:1px dotted #aeb1b8}.note.single .stamina{border-right:0}.stamina strong{font-size:30px;color:#bd8732}.stamina small{margin-top:8px;color:#727780;font-size:15px}.metric{display:flex;justify-content:space-between;align-items:center;padding:13px 22px;border-bottom:1px solid #d8d8d6;font-size:19px}.metric b{font-size:22px}.metric:last-child{border-bottom:0}.challenge-list{padding:18px 24px 8px;background:#f1f0ed;color:#282a30;border-top:1px solid #d8d8d6}.challenge-list h2{margin:0 0 8px;font-size:21px}.challenge-row{display:grid;grid-template-columns:120px 1fr auto;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid #d8d8d6}.challenge-row:last-child{border-bottom:0}.challenge-row strong{font-size:18px}.challenge-floor{font-size:17px;overflow-wrap:anywhere}.challenge-result{display:flex;flex-direction:column;align-items:flex-end;gap:3px}.stars{color:#d39a2d;font-size:23px;letter-spacing:2px;white-space:nowrap}.stars small{color:#737780;font-size:13px;letter-spacing:0}.extra-star{color:#9a7cff;font-style:normal;font-size:25px;margin-left:4px}.anomaly-card{margin:0;padding:18px 24px 20px;background:#f1f0ed;color:#282a30;border-top:1px solid #d8d8d6}.anomaly-row{display:grid;grid-template-columns:120px 1fr auto;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid #d8d8d6}.anomaly-row strong{font-size:18px}.anomaly-season{font-size:17px}.anomaly-extra{font-size:14px;color:#737780}.anomaly-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}.anomaly-grid>div{display:grid;grid-template-columns:auto 1fr;align-items:center;gap:4px 10px;padding:12px 14px;background:#e7e5e2;border:1px solid #d0ceca;border-radius:8px}.anomaly-grid label{grid-column:1/-1;color:#737780;font-size:14px}.anomaly-grid strong{font-size:17px;overflow-wrap:anywhere}.anomaly-grid .stars{grid-column:1/-1}.mob-total{grid-column:1/-1;color:#bd8732;font-size:20px;font-weight:600}</style></head><body><main class="overview"><header class="hero">${avatar}<div class="identity"><div class="nickname">${escape(title)}${data.level ? ` <small>Lv.${escape(data.level)}</small>` : ''}</div><div class="details"><span>${escape(serverName(data.server))}</span> UID ${escape(data.uid)}</div></div></header>${note}${challenges}${anomaly}</main></body></html>`
+      return renderAccountHtml(ctx, html, '.overview')
+    },
     async save(role: GameRole, title: string, summary: string, data?: PanelData) {
       const lines = summary.split('\n').slice(0, 30).map(line => line.slice(0, 120))
       const row: PanelSnapshot = { id: role.id, platform: role.platform, userId: role.userId, game: role.game, uid: role.uid, title: title.slice(0, 80), lines: JSON.stringify(lines), data: data ? JSON.stringify(data) : undefined, updatedAt: new Date().toISOString() }

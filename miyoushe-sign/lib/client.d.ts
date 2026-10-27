@@ -60,7 +60,7 @@ export declare function createClient(ctx: Context, timeout: number, interval: nu
         ticket: string;
     }>;
     qrStatus(ticket: string): Promise<Result>;
-    qrExchange(stoken: string, mid: string): Promise<string>;
+    qrExchange(stoken: string, mid: string | number): Promise<string>;
     exchangeCookie(secret: string, ltuid: string, gameBiz?: string): Promise<string>;
     fingerprint(deviceId: string, overseas: boolean, secret: string): Promise<string>;
     discover(secret: string): Promise<DiscoveredRole[]>;
